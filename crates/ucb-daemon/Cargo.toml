@@ -1,0 +1,21 @@
+[package]
+name = "ucb-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ucb"
+path = "src/main.rs"
+
+[dependencies]
+ucb-core = { workspace = true }
+ucb-crypto = { workspace = true }
+ucb-discovery = { workspace = true }
+ucb-clipboard = { workspace = true }
+ucb-sync = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
