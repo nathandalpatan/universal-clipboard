@@ -436,6 +436,12 @@ impl Shared {
                 tracing::info!(reason = %reason, "peer sent Reject; closing session");
                 Err(Error::Rejected(reason))
             }
+            // Protocol v2 messages (PAIR-7 revocation, FILE transfer) are
+            // handled by the expansion work; ignore until wired in.
+            other => {
+                tracing::debug!(?other, "unhandled v2 message; ignoring");
+                Ok(())
+            }
         }
     }
 

@@ -249,6 +249,7 @@ mod tests {
                     assert_eq!(seq, 42);
                     match item.payload {
                         ClipboardPayload::Text(t) => assert_eq!(t, expected),
+                        other => panic!("expected Text, got {other:?}"),
                     }
                 }
                 other => panic!("expected Clip, got {other:?}"),
