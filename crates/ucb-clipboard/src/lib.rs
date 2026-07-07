@@ -331,6 +331,13 @@ fn worker_loop<C: SystemClipboard>(
             Ok(WorkerCmd::Write { payload, reply }) => {
                 let res = match &payload {
                     ClipboardPayload::Text(text) => clipboard.set_text(text),
+                    // Multi-format write support lands with SYNC-4; until
+                    // then fall back to the text alternative or skip.
+                    ClipboardPayload::Html { alt_text, .. } => clipboard.set_text(alt_text),
+                    ClipboardPayload::Image { .. } => {
+                        tracing::warn!("image clipboard write not yet supported; skipping");
+                        Ok(())
+                    }
                 };
                 if res.is_ok() {
                     // Record our own write so the resulting change is suppressed.

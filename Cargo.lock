@@ -1545,6 +1545,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ucb-files"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tracing",
+ "ucb-core",
+]
+
+[[package]]
+name = "ucb-history"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+ "tracing",
+ "ucb-core",
+]
+
+[[package]]
 name = "ucb-sync"
 version = "0.1.0"
 dependencies = [

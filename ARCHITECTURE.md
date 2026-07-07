@@ -60,6 +60,44 @@ Never sideways or upward.
   device id → { name, static_pubkey, added_ts }. Cap 3 including self
   (PAIR-5).
 
+## Wave 2 (build/expansion) — additional crates and decisions
+
+| Crate | Responsibility | Backlog tickets |
+|---|---|---|
+| `ucb-files` | Transport-agnostic file transfer: chunking, BLAKE3, sender/receiver state machines, resume, temp storage + cleanup | FILE-1 (partial: CLI-initiated), FILE-2/4/5/6/7 (FILE-3 satisfied by session AEAD) |
+| `ucb-history` | Encrypted local history: SQLCipher storage, retention sweep, search/star/delete API | HIST-1/2, HIST-3 backend |
+
+- **Protocol v2** (`PROTOCOL_VERSION = 2`): payload variants `Html`/`Image`,
+  `Revoke`, and `FileOffer/FileAccept/FileReject/FileChunk/FileDone`.
+  v1 peers are rejected at Hello (SYNC-6 working as designed).
+- **Payload size:** clips larger than `MAX_CLIP_BYTES` (8 MiB) are not sent
+  inline — skip with a `tracing::warn`. Files use `FILE_CHUNK_BYTES`
+  (256 KiB) chunks multiplexed through the session channel.
+- **Revocation propagation (PAIR-7):** `ucb revoke` records the revoked id
+  in a `revoked.json` tombstone list next to `trusted.json`. The engine
+  broadcasts `Revoke` to connected peers at session start and when the
+  daemon revokes live; on receiving `Revoke` from a *trusted* peer, remove
+  the device from the local allowlist, add a tombstone, and drop its
+  session. Tombstoned ids may never be re-added without `ucb revoke --forget`.
+- **Offline queue (SYNC-5):** per-peer FIFO, cap 20 items / 24 h age,
+  persisted as JSON next to the allowlist; drained in order on reconnect,
+  then normal live flow. UX-4: on drain, log a "synced N items while away"
+  info line.
+- **Manual peers (DISC-3):** `static_peers: [\"ip:port\", ...]` in
+  config.json; the daemon synthesizes discovery events for them and they
+  are dialed regardless of the device-id dial-direction rule (with backoff).
+- **History (HIST-1):** SQLCipher via `rusqlite` (bundled-sqlcipher);
+  database key is a 32-byte secret in the KeyStore under "history-db-key".
+  Every applied clip (local and remote) is recorded. Retention: sweep on
+  startup and every hour, delete items older than 30 days unless starred
+  (HIST-2). Text payloads store full content; images store dimensions +
+  hash only (space).
+- **Desktop service (BG-1/BG-6):** `ucb service install|uninstall|status`
+  writes a launchd plist (macOS) / systemd user unit (Linux) running
+  `ucb run`; Windows deferred.
+- **Status IPC (UX-1):** `ucb run` serves a JSON status snapshot on a unix
+  socket in the runtime dir; `ucb status` reads it.
+
 ## Conventions
 
 - Async: tokio. Errors: `thiserror` in libs, `anyhow` in the daemon.

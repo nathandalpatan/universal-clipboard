@@ -7,7 +7,17 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 
 /// Wire protocol version (SYNC-6). Bump on breaking protocol changes.
-pub const PROTOCOL_VERSION: u16 = 1;
+/// v2: multi-format payloads (SYNC-4), revocation propagation (PAIR-7),
+/// file transfer messages (FILE-2..5).
+pub const PROTOCOL_VERSION: u16 = 2;
+
+/// Largest clipboard payload sent inline as a single Clip message.
+/// Anything larger must go through the file-transfer path (or be skipped
+/// with a warning) — the transport frame cap is 16 MiB.
+pub const MAX_CLIP_BYTES: usize = 8 * 1024 * 1024;
+
+/// Fixed chunk size for file transfer (FILE-2/4).
+pub const FILE_CHUNK_BYTES: usize = 256 * 1024;
 
 /// mDNS service type used for LAN discovery (DISC-1).
 pub const MDNS_SERVICE_TYPE: &str = "_ucb._tcp.local.";
@@ -79,18 +89,40 @@ pub struct DeviceInfo {
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ClipboardPayload {
     Text(String),
+    /// HTML clipboard content with a plain-text fallback (SYNC-4).
+    Html { html: String, alt_text: String },
+    /// Raw RGBA image, row-major, 4 bytes per pixel (SYNC-4).
+    Image { width: u32, height: u32, rgba: Vec<u8> },
 }
 
 impl ClipboardPayload {
     pub fn content_hash(&self) -> [u8; 32] {
         match self {
             ClipboardPayload::Text(s) => *blake3::hash(s.as_bytes()).as_bytes(),
+            ClipboardPayload::Html { html, alt_text } => {
+                let mut h = blake3::Hasher::new();
+                h.update(b"html\0");
+                h.update(html.as_bytes());
+                h.update(b"\0");
+                h.update(alt_text.as_bytes());
+                *h.finalize().as_bytes()
+            }
+            ClipboardPayload::Image { width, height, rgba } => {
+                let mut h = blake3::Hasher::new();
+                h.update(b"image\0");
+                h.update(&width.to_be_bytes());
+                h.update(&height.to_be_bytes());
+                h.update(rgba);
+                *h.finalize().as_bytes()
+            }
         }
     }
 
     pub fn byte_len(&self) -> usize {
         match self {
             ClipboardPayload::Text(s) => s.len(),
+            ClipboardPayload::Html { html, alt_text } => html.len() + alt_text.len(),
+            ClipboardPayload::Image { rgba, .. } => rgba.len(),
         }
     }
 }
@@ -99,6 +131,15 @@ impl fmt::Debug for ClipboardPayload {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ClipboardPayload::Text(s) => write!(f, "ClipboardPayload::Text(<{} bytes redacted>)", s.len()),
+            ClipboardPayload::Html { html, alt_text } => write!(
+                f,
+                "ClipboardPayload::Html(<{} + {} bytes redacted>)",
+                html.len(),
+                alt_text.len()
+            ),
+            ClipboardPayload::Image { width, height, .. } => {
+                write!(f, "ClipboardPayload::Image({width}x{height}, content redacted)")
+            }
         }
     }
 }
@@ -125,6 +166,16 @@ impl ClipboardItem {
     }
 }
 
+/// File-chunk bytes with a redacted `Debug` (SEC-2).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkData(pub Vec<u8>);
+
+impl fmt::Debug for ChunkData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ChunkData(<{} bytes redacted>)", self.0.len())
+    }
+}
+
 /// Plaintext messages exchanged after the Noise handshake completes.
 /// Each is bincode-serialized, then AEAD-encrypted as one transport frame.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +188,22 @@ pub enum WireMessage {
     Clip { seq: u64, item: ClipboardItem },
     Ping,
     Pong,
+    /// PAIR-7: the sender has revoked `device` from its allowlist; a
+    /// receiving trusted peer should drop `device` from its own allowlist
+    /// and close any live session with it.
+    Revoke { device: DeviceId },
+    /// FILE-2/4: offer of a file transfer. Chunks are FILE_CHUNK_BYTES,
+    /// `hash` is the BLAKE3 of the whole file.
+    FileOffer { transfer_id: u64, name: String, size: u64, chunk_count: u64, hash: [u8; 32] },
+    /// FILE-5: acceptance; `resume_from` is the first chunk index still
+    /// needed (0 for a fresh transfer).
+    FileAccept { transfer_id: u64, resume_from: u64 },
+    FileReject { transfer_id: u64, reason: String },
+    /// One file chunk. Encrypted like every other frame (FILE-3 is
+    /// satisfied by the session channel's AEAD).
+    FileChunk { transfer_id: u64, index: u64, data: ChunkData },
+    /// Receiver-side completion/abort notice.
+    FileDone { transfer_id: u64, ok: bool, detail: String },
 }
 
 impl WireMessage {
