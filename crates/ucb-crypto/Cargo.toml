@@ -9,3 +9,11 @@ ucb-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+snow = { workspace = true }
+keyring = { workspace = true }
+hex = { workspace = true }
+blake3 = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

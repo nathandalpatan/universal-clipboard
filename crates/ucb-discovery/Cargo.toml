@@ -9,3 +9,6 @@ ucb-core = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+mdns-sd = { workspace = true }
+tokio = { workspace = true }
+hex = { workspace = true }
