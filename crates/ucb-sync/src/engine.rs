@@ -28,13 +28,14 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use ucb_clipboard::ClipboardWriter;
@@ -45,6 +46,8 @@ use ucb_crypto::{
     check_clock_skew, handshake_initiator, handshake_responder, Identity, ReplayGuard, SecureChannel,
 };
 use ucb_discovery::PeerEvent;
+use ucb_files::{cleanup_stale, RecvProgress, RecvTransfer, SendAction, SendTransfer};
+use ucb_history::History;
 
 use crate::allowlist::Allowlist;
 use crate::error::{Error, Result};
@@ -67,12 +70,46 @@ const REVOCATION_RECHECK: Duration = Duration::from_secs(30);
 /// away" for the UX-4 receiver-side notice.
 const SYNCED_AWAY_WINDOW: Duration = Duration::from_secs(5);
 
-/// One thing to send out on a session: a live/queued clip, or a revocation
-/// broadcast (PAIR-7).
+/// History retention (HIST-2): drop non-starred entries older than this.
+const HISTORY_RETENTION: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+/// How often the engine runs the history retention sweep (HIST-2). Also run once
+/// at startup.
+const HISTORY_SWEEP_INTERVAL: Duration = Duration::from_secs(60 * 60);
+/// Age past which incomplete `*.part`/`*.meta.json` artifacts are reclaimed
+/// (FILE-7).
+const FILE_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How often the engine reclaims stale file-transfer artifacts (FILE-7). Also
+/// run once at startup.
+const FILE_CLEANUP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// One thing to send out on a session: a live/queued clip, a revocation
+/// broadcast (PAIR-7), or a raw pre-built wire message (used for file-transfer
+/// offers and chunks, FILE-4).
 #[derive(Clone)]
 enum Outbound {
     Clip(ClipboardItem),
     Revoke(DeviceId),
+    Raw(WireMessage),
+}
+
+/// Progress of an outbound file transfer (FILE-4), for the CLI/IPC to surface.
+#[derive(Clone, Copy, Debug)]
+pub struct SendProgress {
+    pub transfer_id: u64,
+    pub sent: u64,
+    pub total: u64,
+}
+
+/// Final outcome of an outbound file transfer (FILE-4).
+#[derive(Clone, Debug)]
+pub struct SendReport {
+    pub transfer_id: u64,
+    pub name: String,
+    pub bytes: u64,
+    /// True only when the receiver confirmed a complete, hash-verified file.
+    pub ok: bool,
+    /// Human-readable detail (rejection reason, receiver error, or empty).
+    pub detail: String,
 }
 
 /// A snapshot of one trusted peer's connection state, for the CLI.
@@ -97,6 +134,16 @@ pub struct EngineConfig {
     /// (DISC-3). Dialed with the reconnect backoff regardless of device-id
     /// ordering; trust is still verified by the handshake + allowlist.
     pub static_peers: Vec<String>,
+    /// Optional encrypted history store (HIST-1/2/3). When present, every applied
+    /// clip (local broadcast and remote-applied) is recorded, and a retention
+    /// sweep runs at startup and hourly. `None` disables history entirely.
+    pub history: Option<Arc<History>>,
+    /// Directory where inbound file transfers are stored (FILE-6). Created on
+    /// demand; also periodically swept for stale artifacts (FILE-7).
+    pub received_dir: PathBuf,
+    /// Reject inbound file offers larger than this many bytes (FILE-6 policy).
+    /// `None` accepts any size.
+    pub max_file_bytes: Option<u64>,
 }
 
 /// A live session's outbound handle.
@@ -135,6 +182,15 @@ struct Shared {
     connectors: Mutex<HashMap<DeviceId, Arc<AtomicBool>>>,
     rate: Mutex<TokenBucketLimiter>,
     token_ctr: AtomicU64,
+    /// HIST-1/2/3: optional encrypted history store.
+    history: Option<Arc<History>>,
+    /// FILE-6: destination directory for inbound file transfers.
+    received_dir: PathBuf,
+    /// FILE-6: inbound file offers larger than this are rejected.
+    max_file_bytes: Option<u64>,
+    /// FILE-4: routes inbound `FileAccept/FileReject/FileDone` for an outbound
+    /// transfer (keyed by `transfer_id`) to its running send-pump task.
+    send_routes: Mutex<HashMap<u64, mpsc::Sender<WireMessage>>>,
 }
 
 /// The running sync engine. Holds its background tasks; dropping it aborts them.
@@ -179,6 +235,10 @@ impl SyncEngine {
             connectors: Mutex::new(HashMap::new()),
             rate: Mutex::new(TokenBucketLimiter::per_minute_5()),
             token_ctr: AtomicU64::new(0),
+            history: config.history,
+            received_dir: config.received_dir,
+            max_file_bytes: config.max_file_bytes,
+            send_routes: Mutex::new(HashMap::new()),
         });
 
         let mut tasks = vec![
@@ -186,7 +246,14 @@ impl SyncEngine {
             tokio::spawn(shared.clone().local_clip_loop(clip_rx)),
             tokio::spawn(shared.clone().discovery_loop(disc_rx)),
             tokio::spawn(shared.clone().revocation_loop()),
+            // FILE-7: reclaim stale inbound-transfer artifacts at start + every 6h.
+            tokio::spawn(shared.clone().file_cleanup_loop()),
         ];
+
+        // HIST-2: only run the retention sweep when history is enabled.
+        if shared.history.is_some() {
+            tasks.push(tokio::spawn(shared.clone().history_sweep_loop()));
+        }
 
         // DISC-3: one always-present connector per configured static peer.
         for addr in config.static_peers {
@@ -215,6 +282,24 @@ impl SyncEngine {
             })
             .collect()
     }
+
+    /// Send a file to a connected peer (FILE-1/4). With `target = Some(id)` the
+    /// file goes to that peer (error if it is not connected); with `None` it goes
+    /// to the single connected peer, erroring (and listing peers) when zero or
+    /// more than one are connected. `progress` optionally receives per-chunk
+    /// updates. Resolves when the receiver reports completion, rejection, or the
+    /// session drops.
+    pub async fn send_file(
+        &self,
+        path: impl AsRef<Path>,
+        target: Option<DeviceId>,
+        progress: Option<mpsc::Sender<SendProgress>>,
+    ) -> Result<SendReport> {
+        self.shared
+            .clone()
+            .send_file(path.as_ref().to_path_buf(), target, progress)
+            .await
+    }
 }
 
 impl Drop for SyncEngine {
@@ -236,6 +321,128 @@ impl Shared {
             name: self.name.clone(),
             platform: self.platform,
         }
+    }
+
+    // --- history (HIST-1/2/3) ---------------------------------------------
+
+    /// Fire-and-forget record of an applied clip into the history store. Runs on
+    /// a blocking thread (rusqlite is synchronous); a failure is logged, never
+    /// propagated. No-op when history is disabled.
+    fn record_history(&self, item: &ClipboardItem, origin_name: &str) {
+        let Some(history) = self.history.clone() else {
+            return;
+        };
+        let item = item.clone();
+        let origin_name = origin_name.to_string();
+        tokio::spawn(async move {
+            let res = tokio::task::spawn_blocking(move || history.record(&item, &origin_name)).await;
+            match res {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => tracing::warn!(error = %e, "failed to record clip in history"),
+                Err(e) => tracing::warn!(error = %e, "history record task panicked"),
+            }
+        });
+    }
+
+    /// HIST-2: sweep expired history at startup, then every hour. Only spawned
+    /// when history is enabled.
+    async fn history_sweep_loop(self: Arc<Self>) {
+        loop {
+            if let Some(history) = self.history.clone() {
+                let res =
+                    tokio::task::spawn_blocking(move || history.sweep(HISTORY_RETENTION, now_ms()))
+                        .await;
+                match res {
+                    Ok(Ok(n)) if n > 0 => tracing::info!(removed = n, "history retention sweep"),
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => tracing::warn!(error = %e, "history sweep failed"),
+                    Err(e) => tracing::warn!(error = %e, "history sweep task panicked"),
+                }
+            }
+            tokio::time::sleep(HISTORY_SWEEP_INTERVAL).await;
+        }
+    }
+
+    // --- file-transfer cleanup (FILE-7) -----------------------------------
+
+    /// FILE-7: reclaim stale `.part`/`.meta.json` artifacts at startup, then
+    /// every 6h. A missing `received_dir` is treated as empty.
+    async fn file_cleanup_loop(self: Arc<Self>) {
+        loop {
+            match cleanup_stale(&self.received_dir, FILE_STALE_AGE).await {
+                Ok(report) if report.removed > 0 => tracing::info!(
+                    removed = report.removed,
+                    bytes = report.bytes_freed,
+                    "reclaimed stale file-transfer artifacts"
+                ),
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = %e, "file-transfer cleanup failed"),
+            }
+            tokio::time::sleep(FILE_CLEANUP_INTERVAL).await;
+        }
+    }
+
+    // --- file-transfer sender (FILE-1/4) ----------------------------------
+
+    /// Resolve a target session, offer `path`, and drive the send to completion.
+    async fn send_file(
+        self: Arc<Self>,
+        path: PathBuf,
+        target: Option<DeviceId>,
+        progress: Option<mpsc::Sender<SendProgress>>,
+    ) -> Result<SendReport> {
+        // Resolve which connected peer receives the file.
+        let out_tx = {
+            let sessions = self.sessions.lock().unwrap();
+            match target {
+                Some(id) => sessions
+                    .get(&id)
+                    .map(|e| e.tx.clone())
+                    .ok_or_else(|| Error::Other(format!("peer {} is not connected", id.short())))?,
+                None => {
+                    let mut iter = sessions.iter();
+                    match (iter.next(), iter.next()) {
+                        (Some((_, entry)), None) => entry.tx.clone(),
+                        (None, _) => {
+                            return Err(Error::Other(
+                                "no connected peers to send to".to_string(),
+                            ))
+                        }
+                        _ => {
+                            let ids: Vec<String> =
+                                sessions.keys().map(|id| id.short()).collect();
+                            return Err(Error::Other(format!(
+                                "multiple peers connected ({}); pass a target",
+                                ids.join(", ")
+                            )));
+                        }
+                    }
+                }
+            }
+        };
+
+        let (transfer, offer) = SendTransfer::offer(&path)
+            .await
+            .map_err(|e| Error::Other(format!("preparing file offer: {e}")))?;
+        let transfer_id = transfer.transfer_id();
+
+        // Register a route so inbound FileAccept/FileReject/FileDone reach the pump.
+        let (inbound_tx, inbound_rx) = mpsc::channel::<WireMessage>(32);
+        self.send_routes
+            .lock()
+            .unwrap()
+            .insert(transfer_id, inbound_tx);
+
+        let (result_tx, result_rx) = oneshot::channel();
+        tokio::spawn(send_pump(
+            transfer, offer, out_tx, inbound_rx, progress, result_tx,
+        ));
+
+        let report = result_rx
+            .await
+            .map_err(|_| Error::Other("file send task ended without a result".to_string()));
+        self.send_routes.lock().unwrap().remove(&transfer_id);
+        report
     }
 
     // --- accept side -------------------------------------------------------
@@ -430,6 +637,8 @@ impl Shared {
 
         let mut guard = ReplayGuard::new();
         let mut out_seq: u64 = 0;
+        // FILE-6: inbound file transfers in flight for this session.
+        let mut recvs: HashMap<u64, RecvTransfer> = HashMap::new();
 
         // PAIR-7: re-read revoked.json (catches an out-of-process `ucb revoke`)
         // and send a Revoke for every tombstone so a formerly-offline third
@@ -477,7 +686,7 @@ impl Shared {
                 inbound = chan.recv() => {
                     match inbound {
                         Ok(msg) => {
-                            match self.handle_inbound_msg(&mut chan, &mut guard, msg).await {
+                            match self.handle_inbound_msg(&mut chan, &mut guard, &peer_name, &mut recvs, msg).await {
                                 Ok(applied) => {
                                     if applied && !settled {
                                         early_applied += 1;
@@ -502,6 +711,8 @@ impl Shared {
                                     m
                                 }
                                 Outbound::Revoke(device) => WireMessage::Revoke { device },
+                                // FILE-4: file offer/chunk built by a send-pump task.
+                                Outbound::Raw(m) => m,
                             };
                             if let Err(e) = chan.send(&msg).await {
                                 tracing::debug!(peer = %peer_id.short(), error = %e, "session write failed");
@@ -541,6 +752,8 @@ impl Shared {
         &self,
         chan: &mut SecureChannel<S>,
         guard: &mut ReplayGuard,
+        peer_name: &str,
+        recvs: &mut HashMap<u64, RecvTransfer>,
         msg: WireMessage,
     ) -> Result<bool>
     where
@@ -562,6 +775,9 @@ impl Shared {
                     apply_incoming(&mut latest, &item)
                 };
                 if apply {
+                    // HIST-1/3: record the applied remote clip under the sender's
+                    // display name.
+                    self.record_history(&item, peer_name);
                     if let Err(e) = self.writer.write(item.payload).await {
                         tracing::warn!(error = %e, "failed to write clip to clipboard");
                     }
@@ -587,16 +803,179 @@ impl Shared {
                 self.apply_revocation(device);
                 Ok(false)
             }
-            // File* messages are wired in by a later integration wave; ignore
-            // them (with their frames already decrypted) until then.
-            WireMessage::FileOffer { .. }
-            | WireMessage::FileAccept { .. }
-            | WireMessage::FileReject { .. }
-            | WireMessage::FileChunk { .. }
-            | WireMessage::FileDone { .. } => {
-                tracing::debug!("ignoring File* message (not yet wired in)");
+            // FILE-6 (receiver): a peer offers a file. Enforce the size policy,
+            // then accept into `received_dir` and reply with the FileAccept.
+            WireMessage::FileOffer {
+                transfer_id,
+                name,
+                size,
+                chunk_count,
+                hash,
+            } => {
+                if let Some(max) = self.max_file_bytes {
+                    if size > max {
+                        let reason = format!("file too large: {size} bytes > limit {max}");
+                        let _ = chan
+                            .send(&WireMessage::FileReject { transfer_id, reason })
+                            .await;
+                        tracing::warn!(transfer_id, size, max, "rejecting oversized file offer");
+                        return Ok(false);
+                    }
+                }
+                let offer = WireMessage::FileOffer {
+                    transfer_id,
+                    name,
+                    size,
+                    chunk_count,
+                    hash,
+                };
+                match RecvTransfer::on_offer(offer, &self.received_dir).await {
+                    Ok((mut recv, accept)) => {
+                        if chan.send(&accept).await.is_err() {
+                            return Ok(false);
+                        }
+                        if recv.is_complete() {
+                            // 0-chunk (empty) file: finalize immediately.
+                            match recv.finish().await {
+                                Ok(path) => self.deliver_received(chan, transfer_id, path).await,
+                                Err(e) => {
+                                    let _ = chan
+                                        .send(&WireMessage::FileDone {
+                                            transfer_id,
+                                            ok: false,
+                                            detail: e.to_string(),
+                                        })
+                                        .await;
+                                    tracing::warn!(transfer_id, error = %e, "failed to finalize empty file");
+                                }
+                            }
+                        } else {
+                            recvs.insert(transfer_id, recv);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = chan
+                            .send(&WireMessage::FileReject {
+                                transfer_id,
+                                reason: e.to_string(),
+                            })
+                            .await;
+                        tracing::warn!(transfer_id, error = %e, "failed to accept file offer");
+                    }
+                }
                 Ok(false)
             }
+            // FILE-6 (receiver): one inbound chunk.
+            WireMessage::FileChunk {
+                transfer_id,
+                index,
+                data,
+            } => {
+                if let Some(recv) = recvs.get_mut(&transfer_id) {
+                    match recv.on_chunk(index, &data.0).await {
+                        Ok(RecvProgress::InProgress { .. }) => {}
+                        Ok(RecvProgress::Completed { path }) => {
+                            recvs.remove(&transfer_id);
+                            self.deliver_received(chan, transfer_id, path).await;
+                        }
+                        Err(e) => {
+                            recvs.remove(&transfer_id);
+                            let _ = chan
+                                .send(&WireMessage::FileDone {
+                                    transfer_id,
+                                    ok: false,
+                                    detail: e.to_string(),
+                                })
+                                .await;
+                            tracing::warn!(transfer_id, error = %e, "inbound file chunk rejected");
+                        }
+                    }
+                } else {
+                    tracing::debug!(transfer_id, "chunk for unknown transfer; ignoring");
+                }
+                Ok(false)
+            }
+            // FILE-4 (sender): replies routed back to the running send-pump task.
+            WireMessage::FileAccept {
+                transfer_id,
+                resume_from,
+            } => {
+                self.forward_reply(
+                    transfer_id,
+                    WireMessage::FileAccept {
+                        transfer_id,
+                        resume_from,
+                    },
+                );
+                Ok(false)
+            }
+            WireMessage::FileReject {
+                transfer_id,
+                reason,
+            } => {
+                self.forward_reply(
+                    transfer_id,
+                    WireMessage::FileReject {
+                        transfer_id,
+                        reason,
+                    },
+                );
+                Ok(false)
+            }
+            WireMessage::FileDone {
+                transfer_id,
+                ok,
+                detail,
+            } => {
+                self.forward_reply(
+                    transfer_id,
+                    WireMessage::FileDone {
+                        transfer_id,
+                        ok,
+                        detail,
+                    },
+                );
+                Ok(false)
+            }
+        }
+    }
+
+    /// Finalize a received file (FILE-6): ack the sender, log the saved path, and
+    /// write that path as a Text clip to the local clipboard.
+    ///
+    /// MVP clipboard-pointer choice: the received file's absolute path is placed
+    /// on the local clipboard as plain text (not the file bytes). The write goes
+    /// through [`ClipboardWriter`], whose echo suppression keeps it from being
+    /// re-broadcast to peers, so the pointer stays local to this device.
+    async fn deliver_received<S>(
+        &self,
+        chan: &mut SecureChannel<S>,
+        transfer_id: u64,
+        path: PathBuf,
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send,
+    {
+        let _ = chan
+            .send(&WireMessage::FileDone {
+                transfer_id,
+                ok: true,
+                detail: String::new(),
+            })
+            .await;
+        tracing::info!(transfer_id, path = %path.display(), "file received");
+        let abs = tokio::fs::canonicalize(&path).await.unwrap_or(path);
+        let pointer = abs.to_string_lossy().into_owned();
+        if let Err(e) = self.writer.write(ClipboardPayload::Text(pointer)).await {
+            tracing::warn!(error = %e, "failed to write received-file pointer to clipboard");
+        }
+    }
+
+    /// Route a file-transfer reply to the send-pump task awaiting it (FILE-4).
+    fn forward_reply(&self, transfer_id: u64, msg: WireMessage) {
+        if let Some(tx) = self.send_routes.lock().unwrap().get(&transfer_id).cloned() {
+            let _ = tx.try_send(msg);
+        } else {
+            tracing::debug!(transfer_id, "file reply for unknown/finished transfer; ignoring");
         }
     }
 
@@ -611,6 +990,8 @@ impl Shared {
             };
             // A local copy is the freshest user intent: record it as latest.
             *self.latest.lock().unwrap() = Some(item.clone());
+            // HIST-1/3: record the local clip under this device's own name.
+            self.record_history(&item, &self.name);
 
             // Snapshot live sessions, then send outside the lock.
             let live: HashMap<DeviceId, mpsc::Sender<Outbound>> = self
@@ -776,6 +1157,120 @@ impl Shared {
             tokio::time::sleep(REVOCATION_RECHECK).await;
             let tombstones = self.refresh_from_disk();
             self.broadcast_revocations(&tombstones);
+        }
+    }
+}
+
+/// Drive a single outbound file transfer (FILE-4): send the offer, wait for the
+/// peer's acceptance, stream chunks through the bounded session channel (natural
+/// backpressure), log progress every 10%, then await the receiver's `FileDone`.
+/// Outbound wire messages go through `out_tx`; inbound replies arrive on
+/// `inbound_rx` via the engine's reply router.
+async fn send_pump(
+    mut transfer: SendTransfer,
+    offer: WireMessage,
+    out_tx: mpsc::Sender<Outbound>,
+    mut inbound_rx: mpsc::Receiver<WireMessage>,
+    progress: Option<mpsc::Sender<SendProgress>>,
+    result_tx: oneshot::Sender<SendReport>,
+) {
+    let transfer_id = transfer.transfer_id();
+    let (name, size) = match &offer {
+        WireMessage::FileOffer { name, size, .. } => (name.clone(), *size),
+        _ => (String::new(), 0),
+    };
+    let report = |ok: bool, detail: String| SendReport {
+        transfer_id,
+        name: name.clone(),
+        bytes: size,
+        ok,
+        detail,
+    };
+
+    // 1. Transmit the offer.
+    if out_tx.send(Outbound::Raw(offer)).await.is_err() {
+        let _ = result_tx.send(report(false, "session closed before offer".into()));
+        return;
+    }
+
+    // 2. Wait for acceptance (or an early rejection / done).
+    loop {
+        match inbound_rx.recv().await {
+            Some(msg) => match transfer.on_message(msg) {
+                SendAction::Accepted { .. } => break,
+                SendAction::Rejected { reason } => {
+                    tracing::info!(name = %name, reason = %reason, "file offer rejected by peer");
+                    let _ = result_tx.send(report(false, format!("rejected: {reason}")));
+                    return;
+                }
+                SendAction::Done { ok, detail } => {
+                    let _ = result_tx.send(report(ok, detail));
+                    return;
+                }
+                SendAction::Ignored => {}
+            },
+            None => {
+                let _ = result_tx.send(report(false, "session closed awaiting acceptance".into()));
+                return;
+            }
+        }
+    }
+
+    // 3. Stream chunks, logging progress every 10% (FILE-4; a GUI spinner is
+    //    UX-3 future work).
+    let mut next_pct: u64 = 10;
+    loop {
+        match transfer.next_chunk().await {
+            Ok(Some(chunk)) => {
+                if out_tx.send(Outbound::Raw(chunk)).await.is_err() {
+                    let _ = result_tx.send(report(false, "session closed mid-transfer".into()));
+                    return;
+                }
+                let (sent, total) = transfer.progress();
+                if let Some(p) = &progress {
+                    let _ = p
+                        .send(SendProgress {
+                            transfer_id,
+                            sent,
+                            total,
+                        })
+                        .await;
+                }
+                if let Some(pct) = sent.checked_mul(100).and_then(|n| n.checked_div(total)) {
+                    if pct >= next_pct {
+                        tracing::info!(name = %name, percent = pct, "file transfer progress");
+                        while next_pct <= pct {
+                            next_pct += 10;
+                        }
+                    }
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                let _ = result_tx.send(report(false, format!("read error: {e}")));
+                return;
+            }
+        }
+    }
+
+    // 4. Await the receiver's completion notice.
+    loop {
+        match inbound_rx.recv().await {
+            Some(msg) => {
+                if let SendAction::Done { ok, detail } = transfer.on_message(msg) {
+                    if ok {
+                        tracing::info!(name = %name, "file transfer complete");
+                    } else {
+                        tracing::warn!(name = %name, detail = %detail, "file transfer failed on receiver");
+                    }
+                    let _ = result_tx.send(report(ok, detail));
+                    return;
+                }
+            }
+            None => {
+                let _ = result_tx.send(report(false, "session closed awaiting completion".into()));
+                return;
+            }
         }
     }
 }

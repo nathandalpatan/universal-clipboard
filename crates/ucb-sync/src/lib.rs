@@ -17,7 +17,7 @@ mod queue;
 mod rate_limit;
 
 pub use allowlist::{Allowlist, TrustedDevice};
-pub use engine::{EngineConfig, PeerStatus, SyncEngine};
+pub use engine::{EngineConfig, PeerStatus, SendProgress, SendReport, SyncEngine};
 pub use error::{Error, Result};
 pub use pairing::{pair_dial, pair_listen, ConfirmPairing};
 pub use queue::{OfflineQueue, QUEUE_CAP, QUEUE_MAX_AGE_MS};

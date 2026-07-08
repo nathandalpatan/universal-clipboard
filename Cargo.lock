@@ -1628,6 +1628,8 @@ dependencies = [
  "ucb-core",
  "ucb-crypto",
  "ucb-discovery",
+ "ucb-files",
+ "ucb-history",
  "ucb-sync",
 ]
 
@@ -1687,6 +1689,8 @@ dependencies = [
  "ucb-core",
  "ucb-crypto",
  "ucb-discovery",
+ "ucb-files",
+ "ucb-history",
 ]
 
 [[package]]
