@@ -83,7 +83,7 @@ dex_bg() {
 # ---------------------------------------------------------------------------
 if [ "${DO_BUILD}" -eq 1 ]; then
     log "building image..."
-    "${COMPOSE[@]}" build || { fail "docker build"; exit 1; }
+    "${COMPOSE[@]}" build alpha || { fail "docker build"; exit 1; }
 fi
 
 log "starting containers..."
