@@ -26,9 +26,8 @@ services:
     init: true
 
   beta:
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
+    # No build section: reuses the ucb-daemon:harness image built via alpha.
+    # (Both services building the same tag races BuildKit's image export.)
     image: ucb-daemon:harness
     container_name: ucb-beta
     hostname: beta
