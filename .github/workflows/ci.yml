@@ -1,0 +1,81 @@
+# REL-1 (partial): continuous integration for the universal-clipboard workspace.
+#
+# On every push and pull request, build + test + lint the whole workspace on
+# Linux and macOS, then produce a release `ucb` daemon binary as a downloadable
+# artifact.
+#
+# FUTURE WORK (out of scope for REL-1 here): signed release publishing via the
+# tauri-updater / signed-manifest pipeline (code-signing, notarization, and a
+# self-hosted update manifest) is not wired up yet. This workflow only uploads
+# an unsigned CI build artifact for smoke-testing.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test-lint:
+    name: build/test/lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux system deps:
+      #   - libdbus-1-dev: secret-service backend used by the `keyring` crate
+      #   - libxcb*-dev:   X11/XCB dev libs required to build `arboard`
+      #   - pkg-config:    lets the -sys crates locate the above
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build release daemon
+        run: cargo build --release -p ucb-daemon
+
+      # The daemon's [[bin]] is named `ucb` (see crates/ucb-daemon/Cargo.toml).
+      - name: Upload ucb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ucb-${{ matrix.os }}
+          path: |
+            target/release/ucb
+            target/release/ucb.exe
+          if-no-files-found: warn
+          retention-days: 14

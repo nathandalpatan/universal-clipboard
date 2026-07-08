@@ -1,0 +1,4 @@
+target/
+corpus/
+# Keep crash reproducers if any are ever committed deliberately; ignore the
+# transient empty per-target artifact dirs otherwise.

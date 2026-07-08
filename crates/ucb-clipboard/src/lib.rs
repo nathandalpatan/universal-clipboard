@@ -38,13 +38,14 @@
 //! In practice a consumer (ucb-sync) holds both for the lifetime of the service
 //! and drops them together to shut it down. Hold both alive to keep watching.
 
+use std::borrow::Cow;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 use tokio::sync::{mpsc, oneshot};
-use ucb_core::ClipboardPayload;
+use ucb_core::{ClipboardPayload, MAX_CLIP_BYTES};
 
 /// Result type for clipboard operations.
 pub type Result<T> = std::result::Result<T, Error>;
@@ -67,12 +68,16 @@ pub enum Error {
 ///
 /// Implementors are used from a single dedicated thread; the `Send + 'static`
 /// bound only exists so the value can be *moved onto* that thread.
+///
+/// This is a full multi-format surface (SYNC-4): a single [`ClipboardPayload`]
+/// carries text, HTML (with a plain-text alternative), or a raw RGBA image.
 pub trait SystemClipboard: Send + 'static {
-    /// Return the current clipboard text, or `Ok(None)` if the clipboard is
-    /// empty or holds non-text content. Non-text/empty is never an error.
-    fn get_text(&mut self) -> Result<Option<String>>;
-    /// Replace the clipboard contents with `text`.
-    fn set_text(&mut self, text: &str) -> Result<()>;
+    /// Return the current clipboard contents as a [`ClipboardPayload`], or
+    /// `Ok(None)` if the clipboard is empty or holds content we cannot map to
+    /// a payload variant. Empty / unsupported content is never an error.
+    fn get(&mut self) -> Result<Option<ClipboardPayload>>;
+    /// Replace the clipboard contents with `payload`.
+    fn set(&mut self, payload: &ClipboardPayload) -> Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -80,8 +85,8 @@ pub trait SystemClipboard: Send + 'static {
 // ---------------------------------------------------------------------------
 
 enum ArboardCmd {
-    Get(std_mpsc::Sender<Result<Option<String>>>),
-    Set(String, std_mpsc::Sender<Result<()>>),
+    Get(std_mpsc::Sender<Result<Option<ClipboardPayload>>>),
+    Set(ClipboardPayload, std_mpsc::Sender<Result<()>>),
 }
 
 /// Real OS clipboard backed by the `arboard` crate.
@@ -89,6 +94,34 @@ enum ArboardCmd {
 /// Construction spawns a dedicated thread that owns the (possibly non-`Send`)
 /// `arboard::Clipboard`; this handle just forwards commands to it, which is what
 /// lets `ArboardClipboard` be `Send`.
+///
+/// # Read strategy (SYNC-4)
+///
+/// The documented priority is image > HTML > text, but reading an image on
+/// every poll is expensive on macOS (the pasteboard stores TIFF, which arboard
+/// decodes into RGBA on each `get_image`). arboard exposes no cheap
+/// "is an image present?" probe, so we use *text presence* as a cheap gate:
+///
+/// * If plain text is present (the common case), we never call `get_image` —
+///   text and images practically never coexist on the clipboard. We still
+///   check `get().html()`: if HTML is also present we return the richer
+///   [`ClipboardPayload::Html`] (HTML over plain text), otherwise
+///   [`ClipboardPayload::Text`].
+/// * Only when text is absent do we pay for `get_image`; failing that we fall
+///   back to an HTML-only read, then to `None`.
+///
+/// The tradeoff: an image copied together with text (rare) is reported as
+/// text/HTML rather than as an image. In exchange, the steady-state text-poll
+/// path never decodes an image.
+///
+/// # HTML echo caveat (macOS)
+///
+/// arboard's `set_html` wraps the HTML in a `<html><head>…</head><body>…`
+/// document on macOS, so reading our own HTML write back yields *different*
+/// bytes than we wrote. Echo-loop suppression (SYNC-2) is by content hash, so
+/// a locally-written HTML clip may not be recognised as its own echo on macOS
+/// and can be re-broadcast once. Text and image writes round-trip byte-for-byte
+/// and are unaffected. (Not exercised in tests, which use [`MockClipboard`].)
 pub struct ArboardClipboard {
     tx: std_mpsc::Sender<ArboardCmd>,
 }
@@ -117,19 +150,10 @@ impl ArboardClipboard {
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         ArboardCmd::Get(reply) => {
-                            let r = match clipboard.get_text() {
-                                Ok(s) => Ok(Some(s)),
-                                // Empty clipboard / non-text content is not an error.
-                                Err(arboard::Error::ContentNotAvailable) => Ok(None),
-                                Err(e) => Err(Error::Backend(e.to_string())),
-                            };
-                            let _ = reply.send(r);
+                            let _ = reply.send(arboard_get(&mut clipboard));
                         }
-                        ArboardCmd::Set(text, reply) => {
-                            let r = clipboard
-                                .set_text(text)
-                                .map_err(|e| Error::Backend(e.to_string()));
-                            let _ = reply.send(r);
+                        ArboardCmd::Set(payload, reply) => {
+                            let _ = reply.send(arboard_set(&mut clipboard, &payload));
                         }
                     }
                 }
@@ -145,7 +169,7 @@ impl ArboardClipboard {
 }
 
 impl SystemClipboard for ArboardClipboard {
-    fn get_text(&mut self) -> Result<Option<String>> {
+    fn get(&mut self) -> Result<Option<ClipboardPayload>> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.tx
             .send(ArboardCmd::Get(reply_tx))
@@ -153,13 +177,65 @@ impl SystemClipboard for ArboardClipboard {
         reply_rx.recv().map_err(|_| Error::WorkerStopped)?
     }
 
-    fn set_text(&mut self, text: &str) -> Result<()> {
+    fn set(&mut self, payload: &ClipboardPayload) -> Result<()> {
         let (reply_tx, reply_rx) = std_mpsc::channel();
         self.tx
-            .send(ArboardCmd::Set(text.to_owned(), reply_tx))
+            .send(ArboardCmd::Set(payload.clone(), reply_tx))
             .map_err(|_| Error::WorkerStopped)?;
         reply_rx.recv().map_err(|_| Error::WorkerStopped)?
     }
+}
+
+/// Read the OS clipboard into a [`ClipboardPayload`]. Runs on the dedicated
+/// arboard thread. See [`ArboardClipboard`] for the read-priority rationale.
+fn arboard_get(clipboard: &mut arboard::Clipboard) -> Result<Option<ClipboardPayload>> {
+    match clipboard.get_text() {
+        // Text present: prefer HTML if it is also on the clipboard, else text.
+        // Do not probe for an image here (it practically never coexists with
+        // text, and get_image is the expensive call we want to avoid per poll).
+        Ok(text) => match clipboard.get().html() {
+            Ok(html) if !html.is_empty() => {
+                Ok(Some(ClipboardPayload::Html { html, alt_text: text }))
+            }
+            _ => Ok(Some(ClipboardPayload::Text(text))),
+        },
+        // No text: now it is worth checking for an image, then HTML-only.
+        Err(arboard::Error::ContentNotAvailable) => match clipboard.get_image() {
+            Ok(img) => Ok(Some(ClipboardPayload::Image {
+                width: img.width as u32,
+                height: img.height as u32,
+                rgba: img.bytes.into_owned(),
+            })),
+            Err(arboard::Error::ContentNotAvailable) => match clipboard.get().html() {
+                Ok(html) if !html.is_empty() => Ok(Some(ClipboardPayload::Html {
+                    html,
+                    alt_text: String::new(),
+                })),
+                _ => Ok(None),
+            },
+            Err(e) => Err(Error::Backend(e.to_string())),
+        },
+        Err(e) => Err(Error::Backend(e.to_string())),
+    }
+}
+
+/// Write a [`ClipboardPayload`] to the OS clipboard. Runs on the dedicated
+/// arboard thread. The image bytes are borrowed from the payload (no copy).
+fn arboard_set(clipboard: &mut arboard::Clipboard, payload: &ClipboardPayload) -> Result<()> {
+    let r = match payload {
+        ClipboardPayload::Text(text) => clipboard.set_text(text.as_str()),
+        ClipboardPayload::Html { html, alt_text } => {
+            clipboard.set_html(html.as_str(), Some(alt_text.as_str()))
+        }
+        ClipboardPayload::Image { width, height, rgba } => {
+            clipboard.set_image(arboard::ImageData {
+                width: *width as usize,
+                height: *height as usize,
+                bytes: Cow::Borrowed(rgba),
+            })
+        }
+    };
+    r.map_err(|e| Error::Backend(e.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -168,25 +244,45 @@ impl SystemClipboard for ArboardClipboard {
 
 /// Handle to a [`MockClipboard`]'s shared state, so tests can inject "external"
 /// clipboard changes and inspect what the service wrote.
+///
+/// The shared state is a full [`ClipboardPayload`] (SYNC-4). The string-based
+/// [`set`](Self::set) / [`get`](Self::get) helpers are retained for existing
+/// text-only tests; [`set_payload`](Self::set_payload) /
+/// [`get_payload`](Self::get_payload) drive the full multi-format surface.
 #[derive(Clone)]
 pub struct MockClipboardHandle {
-    state: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<Option<ClipboardPayload>>>,
 }
 
 impl MockClipboardHandle {
-    /// Simulate an external app copying `text` to the clipboard.
+    /// Simulate an external app copying plain `text` to the clipboard.
     pub fn set(&self, text: impl Into<String>) {
-        *self.state.lock().expect("mock clipboard poisoned") = Some(text.into());
+        self.set_payload(ClipboardPayload::Text(text.into()));
     }
 
-    /// Simulate the clipboard being cleared / holding non-text content.
+    /// Simulate an external app copying an arbitrary payload to the clipboard.
+    pub fn set_payload(&self, payload: ClipboardPayload) {
+        *self.state.lock().expect("mock clipboard poisoned") = Some(payload);
+    }
+
+    /// Simulate the clipboard being cleared / holding unsupported content.
     pub fn clear(&self) {
         *self.state.lock().expect("mock clipboard poisoned") = None;
     }
 
-    /// Read the current mock clipboard contents (e.g. to assert what the
-    /// service wrote).
+    /// Read the current mock clipboard contents as text (e.g. to assert what
+    /// the service wrote). Returns the text for `Text`, the plain-text
+    /// alternative for `Html`, and `None` for images / an empty clipboard.
     pub fn get(&self) -> Option<String> {
+        match &*self.state.lock().expect("mock clipboard poisoned") {
+            Some(ClipboardPayload::Text(s)) => Some(s.clone()),
+            Some(ClipboardPayload::Html { alt_text, .. }) => Some(alt_text.clone()),
+            _ => None,
+        }
+    }
+
+    /// Read the current mock clipboard contents as a full payload.
+    pub fn get_payload(&self) -> Option<ClipboardPayload> {
         self.state.lock().expect("mock clipboard poisoned").clone()
     }
 }
@@ -195,7 +291,7 @@ impl MockClipboardHandle {
 /// [`MockClipboard::new`], which also hands back a [`MockClipboardHandle`] for
 /// injecting changes from the test thread.
 pub struct MockClipboard {
-    state: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<Option<ClipboardPayload>>>,
 }
 
 impl MockClipboard {
@@ -212,12 +308,12 @@ impl MockClipboard {
 }
 
 impl SystemClipboard for MockClipboard {
-    fn get_text(&mut self) -> Result<Option<String>> {
+    fn get(&mut self) -> Result<Option<ClipboardPayload>> {
         Ok(self.state.lock().expect("mock clipboard poisoned").clone())
     }
 
-    fn set_text(&mut self, text: &str) -> Result<()> {
-        *self.state.lock().expect("mock clipboard poisoned") = Some(text.to_owned());
+    fn set(&mut self, payload: &ClipboardPayload) -> Result<()> {
+        *self.state.lock().expect("mock clipboard poisoned") = Some(payload.clone());
         Ok(())
     }
 }
@@ -280,8 +376,8 @@ impl ClipboardService {
 
         // Establish the baseline synchronously so pre-existing content is not
         // emitted as a spurious change and does not race the first real change.
-        let initial_seen = match clipboard.get_text() {
-            Ok(Some(text)) => Some(text_hash(&text)),
+        let initial_seen = match clipboard.get() {
+            Ok(Some(payload)) => Some(payload.content_hash()),
             Ok(None) => None,
             Err(e) => {
                 tracing::warn!(error = %e, "initial clipboard read failed");
@@ -296,10 +392,6 @@ impl ClipboardService {
 
         (ClipboardWriter { tx: cmd_tx }, event_rx)
     }
-}
-
-fn text_hash(text: &str) -> [u8; 32] {
-    *blake3::hash(text.as_bytes()).as_bytes()
 }
 
 /// The single thread that owns the clipboard backend and all watcher state.
@@ -329,41 +421,41 @@ fn worker_loop<C: SystemClipboard>(
     loop {
         match cmd_rx.recv_timeout(poll_interval) {
             Ok(WorkerCmd::Write { payload, reply }) => {
-                let res = match &payload {
-                    ClipboardPayload::Text(text) => clipboard.set_text(text),
-                    // Multi-format write support lands with SYNC-4; until
-                    // then fall back to the text alternative or skip.
-                    ClipboardPayload::Html { alt_text, .. } => clipboard.set_text(alt_text),
-                    ClipboardPayload::Image { .. } => {
-                        tracing::warn!("image clipboard write not yet supported; skipping");
-                        Ok(())
-                    }
-                };
+                // Full multi-format write (SYNC-4): text, HTML, or image.
+                let res = clipboard.set(&payload);
                 if res.is_ok() {
-                    // Record our own write so the resulting change is suppressed.
+                    // Record our own write so the resulting change is suppressed
+                    // (echo-loop prevention across all variants, SYNC-2). The
+                    // hash is format-aware via ClipboardPayload::content_hash.
                     last_written = Some(payload.content_hash());
                 }
                 let _ = reply.send(res);
             }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                match clipboard.get_text() {
-                    Ok(Some(text)) => {
-                        let h = text_hash(&text);
+                match clipboard.get() {
+                    Ok(Some(payload)) => {
+                        let h = payload.content_hash();
                         if Some(h) != last_seen {
                             let was_echo = last_written == Some(h);
                             // Any observed change consumes the echo token.
                             last_written = None;
                             last_seen = Some(h);
-                            if !was_echo
-                                && event_tx
-                                    .blocking_send(ClipboardPayload::Text(text))
-                                    .is_err()
-                            {
-                                break; // event receiver dropped -> shut down
+                            if !was_echo {
+                                // Skip payloads too large to send inline; never
+                                // log content (SEC-2), only the size.
+                                if payload.byte_len() > MAX_CLIP_BYTES {
+                                    tracing::warn!(
+                                        bytes = payload.byte_len(),
+                                        max = MAX_CLIP_BYTES,
+                                        "clipboard payload exceeds MAX_CLIP_BYTES; skipping"
+                                    );
+                                } else if event_tx.blocking_send(payload).is_err() {
+                                    break; // event receiver dropped -> shut down
+                                }
                             }
                         }
                     }
-                    // Empty / non-text clipboard: nothing to report.
+                    // Empty / unsupported clipboard content: nothing to report.
                     Ok(None) => {}
                     // Transient read error: log and keep polling.
                     Err(e) => tracing::warn!(error = %e, "clipboard read failed"),
@@ -396,6 +488,14 @@ mod tests {
 
     fn text(s: &str) -> ClipboardPayload {
         ClipboardPayload::Text(s.into())
+    }
+
+    fn html(html: &str, alt: &str) -> ClipboardPayload {
+        ClipboardPayload::Html { html: html.into(), alt_text: alt.into() }
+    }
+
+    fn image(width: u32, height: u32, rgba: Vec<u8>) -> ClipboardPayload {
+        ClipboardPayload::Image { width, height, rgba }
     }
 
     const POLL: Duration = Duration::from_millis(2);
@@ -459,5 +559,74 @@ mod tests {
         // a genuine later copy of X must be reported.
         handle.set("X");
         assert_eq!(recv(&mut rx).await, text("X"));
+    }
+
+    // ---- SYNC-4: multi-format payloads ------------------------------------
+
+    #[tokio::test]
+    async fn html_payload_roundtrip_through_service() {
+        let (mock, handle) = MockClipboard::new();
+        let (writer, mut rx) = ClipboardService::start(mock, POLL);
+
+        // Injected external HTML is emitted as a full Html payload.
+        let injected = html("<b>hi</b>", "hi");
+        handle.set_payload(injected.clone());
+        assert_eq!(recv(&mut rx).await, injected);
+
+        // Writing our own (different) HTML back is echo-suppressed.
+        let written = html("<i>yo</i>", "yo");
+        writer.write(written.clone()).await.unwrap();
+        assert!(no_event(&mut rx).await, "own html write must not echo back");
+        assert_eq!(handle.get_payload(), Some(written));
+
+        // A genuine external change afterwards is still reported.
+        handle.set("plain");
+        assert_eq!(recv(&mut rx).await, text("plain"));
+    }
+
+    #[tokio::test]
+    async fn image_payload_change_detection_and_echo_prevention() {
+        let (mock, handle) = MockClipboard::new();
+        let (writer, mut rx) = ClipboardService::start(mock, POLL);
+
+        let img = image(2, 1, vec![1, 2, 3, 4, 5, 6, 7, 8]);
+        handle.set_payload(img.clone());
+        assert_eq!(recv(&mut rx).await, img);
+
+        // Same image injected again -> no duplicate event (format-aware hash).
+        handle.set_payload(img.clone());
+        assert!(no_event(&mut rx).await, "duplicate image should not emit");
+
+        // Our own image write is echo-suppressed.
+        let img2 = image(1, 1, vec![9, 9, 9, 9]);
+        writer.write(img2.clone()).await.unwrap();
+        assert!(no_event(&mut rx).await, "own image write must not echo back");
+        assert_eq!(handle.get_payload(), Some(img2));
+    }
+
+    #[tokio::test]
+    async fn oversized_payload_is_skipped() {
+        let (mock, handle) = MockClipboard::new();
+        let (_writer, mut rx) = ClipboardService::start(mock, POLL);
+
+        // Cheaply construct an image whose RGBA buffer exceeds MAX_CLIP_BYTES.
+        let big = image(1, 1, vec![0u8; ucb_core::MAX_CLIP_BYTES + 1]);
+        handle.set_payload(big);
+        assert!(no_event(&mut rx).await, "oversized payload must be skipped");
+
+        // The watcher keeps working: a normal change afterwards is reported.
+        handle.set("ok");
+        assert_eq!(recv(&mut rx).await, text("ok"));
+    }
+
+    #[test]
+    fn distinct_hashes_for_text_and_html() {
+        // Format-aware hashing keeps Text("x") and Html{html:"x",..} distinct,
+        // which is what makes cross-format echo suppression correct.
+        assert_ne!(
+            text("x").content_hash(),
+            html("x", "x").content_hash(),
+            "Text and Html with the same string must not collide"
+        );
     }
 }

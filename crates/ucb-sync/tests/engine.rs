@@ -12,7 +12,7 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 
 use ucb_clipboard::{ClipboardService, MockClipboard, MockClipboardHandle};
-use ucb_core::Platform;
+use ucb_core::{DeviceId, Platform};
 use ucb_crypto::{FileKeyStore, Identity};
 use ucb_discovery::{Peer, PeerEvent};
 use ucb_sync::{Allowlist, EngineConfig, SyncEngine};
@@ -60,6 +60,16 @@ struct Node {
 /// Build a fully wired engine bound to an ephemeral loopback port. Returns the
 /// node plus the port it is listening on.
 async fn start_node(name: &str, identity: Identity, allowlist_path: PathBuf) -> (Node, u16) {
+    start_node_with_static(name, identity, allowlist_path, Vec::new()).await
+}
+
+/// Like [`start_node`] but with configured static peers (DISC-3).
+async fn start_node_with_static(
+    name: &str,
+    identity: Identity,
+    allowlist_path: PathBuf,
+    static_peers: Vec<String>,
+) -> (Node, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
@@ -73,6 +83,7 @@ async fn start_node(name: &str, identity: Identity, allowlist_path: PathBuf) -> 
             allowlist_path,
             device_name: name.to_string(),
             platform: Platform::Linux,
+            static_peers,
         },
         listener,
         writer,
@@ -264,4 +275,185 @@ async fn allowlist_persistence_and_revoke() {
     assert!(!reloaded.is_trusted(&id));
     let after = Allowlist::load(&path).unwrap();
     assert!(!after.is_trusted(&id));
+}
+
+// --- PAIR-7 revocation propagation ---------------------------------------
+
+/// PAIR-7 (handler level): `revoke` removes from the allowlist, records a
+/// tombstone, is idempotent (so remote `Revoke` never loops), blocks re-adding,
+/// and `forget` clears the tombstone.
+#[tokio::test]
+async fn revoke_tombstones_blocks_readd_and_forget_clears() {
+    let dir = temp_dir("revoke-handler");
+    let path = dir.join("trusted.json");
+    let id = DeviceId([5; 32]);
+
+    let mut al = Allowlist::load(&path).unwrap();
+    al.add(id, "Victim", &[5; 32], now_ms()).unwrap();
+    assert!(al.is_trusted(&id));
+
+    // Revoke: removed from allowlist + tombstoned; first call is "newly true".
+    assert!(al.revoke(id).unwrap(), "first revoke should be newly-applied");
+    assert!(!al.is_trusted(&id));
+    assert!(al.is_tombstoned(&id));
+
+    // Idempotent: re-revoking a tombstoned device is a no-op (no loop).
+    assert!(!al.revoke(id).unwrap(), "second revoke must be a no-op");
+
+    // Re-adding a tombstoned device fails.
+    let err = al.add(id, "Victim", &[5; 32], now_ms()).unwrap_err();
+    assert!(matches!(err, ucb_sync::Error::Tombstoned(_)), "got {err:?}");
+
+    // Tombstone persists across reload; revoked.json is written next to it.
+    assert!(dir.join("revoked.json").exists());
+    let mut reloaded = Allowlist::load(&path).unwrap();
+    assert!(reloaded.is_tombstoned(&id));
+
+    // forget clears the tombstone; re-add now succeeds.
+    assert!(reloaded.forget(&id).unwrap());
+    assert!(!reloaded.is_tombstoned(&id));
+    reloaded.add(id, "Victim", &[5; 32], now_ms()).unwrap();
+    assert!(reloaded.is_trusted(&id));
+}
+
+/// PAIR-7 (engine level, three-device story): A has revoked device X. When A and
+/// B connect, A broadcasts `Revoke{X}` at session start; B must remove X from
+/// its allowlist and tombstone it — even though X was never online.
+#[tokio::test]
+async fn revoke_propagates_to_third_device_on_connect() {
+    let dir_a = temp_dir("rev-a");
+    let dir_b = temp_dir("rev-b");
+    let id_a = Identity::load_or_generate(&FileKeyStore::new(dir_a.join("keys"))).unwrap();
+    let id_b = Identity::load_or_generate(&FileKeyStore::new(dir_b.join("keys"))).unwrap();
+    let (dev_a, pk_a) = (id_a.device_id(), id_a.public_key());
+    let (dev_b, pk_b) = (id_b.device_id(), id_b.public_key());
+
+    // X is a third (offline) device both A and B trust.
+    let dev_x = DeviceId([0xEE; 32]);
+    let pk_x = [0xEE; 32];
+
+    let al_a = dir_a.join("trusted.json");
+    let al_b = dir_b.join("trusted.json");
+    {
+        let mut a = Allowlist::load(&al_a).unwrap();
+        a.add(dev_b, "B", &pk_b, now_ms()).unwrap();
+        a.add(dev_x, "X", &pk_x, now_ms()).unwrap();
+        // A revokes X locally *before* starting.
+        assert!(a.revoke(dev_x).unwrap());
+    }
+    {
+        let mut b = Allowlist::load(&al_b).unwrap();
+        b.add(dev_a, "A", &pk_a, now_ms()).unwrap();
+        b.add(dev_x, "X", &pk_x, now_ms()).unwrap();
+    }
+
+    let (node_a, port_a) = start_node("A", id_a, al_a).await;
+    let (node_b, port_b) = start_node("B", id_b, al_b.clone()).await;
+
+    node_a.disc_tx.send(peer_event(dev_b, "B", port_b)).await.unwrap();
+    node_b.disc_tx.send(peer_event(dev_a, "A", port_a)).await.unwrap();
+
+    // Wait until B has removed X and tombstoned it (learned via A's Revoke).
+    let propagated = wait_for(|| {
+        let b = Allowlist::load(&al_b).unwrap();
+        (!b.is_trusted(&dev_x) && b.is_tombstoned(&dev_x)).then_some(())
+    })
+    .await;
+    assert!(propagated.is_some(), "revocation of X did not propagate to B");
+
+    // B still trusts A (the messenger) — only X was revoked.
+    assert!(Allowlist::load(&al_b).unwrap().is_trusted(&dev_a));
+}
+
+// --- SYNC-5 offline queue ------------------------------------------------
+
+/// SYNC-5/UX-4: clips copied on A while B is offline are buffered, then drained
+/// in order when B connects; B ends up with the last item.
+#[tokio::test]
+async fn offline_queue_drains_on_connect_in_order() {
+    let dir_a = temp_dir("q-a");
+    let dir_b = temp_dir("q-b");
+    let id_a = Identity::load_or_generate(&FileKeyStore::new(dir_a.join("keys"))).unwrap();
+    let id_b = Identity::load_or_generate(&FileKeyStore::new(dir_b.join("keys"))).unwrap();
+    let (dev_a, pk_a) = (id_a.device_id(), id_a.public_key());
+    let (dev_b, pk_b) = (id_b.device_id(), id_b.public_key());
+
+    let al_a = dir_a.join("trusted.json");
+    let al_b = dir_b.join("trusted.json");
+    Allowlist::load(&al_a).unwrap().add(dev_b, "B", &pk_b, now_ms()).unwrap();
+    Allowlist::load(&al_b).unwrap().add(dev_a, "A", &pk_a, now_ms()).unwrap();
+
+    // Start A only. B is offline, so copies on A are buffered for B.
+    let (node_a, port_a) = start_node("A", id_a, al_a).await;
+
+    // Space copies beyond the poll interval so each is observed and enqueued.
+    for text in ["q1", "q2", "q3"] {
+        node_a.handle.set(text);
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+
+    // Wait for the queue file to reflect the last buffered item.
+    let queue_file = dir_a.join("queue.json");
+    let queued = wait_for(|| {
+        std::fs::read_to_string(&queue_file)
+            .ok()
+            .filter(|s| s.contains("q3"))
+            .map(|_| ())
+    })
+    .await;
+    assert!(queued.is_some(), "clips were not buffered for offline B");
+
+    // Bring B up and connect; A drains the queue to B in order.
+    let (node_b, port_b) = start_node("B", id_b, al_b).await;
+    node_a.disc_tx.send(peer_event(dev_b, "B", port_b)).await.unwrap();
+    node_b.disc_tx.send(peer_event(dev_a, "A", port_a)).await.unwrap();
+
+    // B's clipboard should end on the LAST buffered item (conflict resolution
+    // keeps the newest; drained in FIFO order).
+    let got = wait_for(|| node_b.handle.get().filter(|s| s == "q3").map(|_| ())).await;
+    assert!(got.is_some(), "offline queue did not drain last item to B");
+}
+
+// --- DISC-3 static peers -------------------------------------------------
+
+/// DISC-3: an engine dials a configured static peer with no discovery event at
+/// all, and clipboard sync works over that connection.
+#[tokio::test]
+async fn static_peer_is_dialed_without_discovery() {
+    let dir_a = temp_dir("static-a");
+    let dir_b = temp_dir("static-b");
+    let id_a = Identity::load_or_generate(&FileKeyStore::new(dir_a.join("keys"))).unwrap();
+    let id_b = Identity::load_or_generate(&FileKeyStore::new(dir_b.join("keys"))).unwrap();
+    let (dev_a, pk_a) = (id_a.device_id(), id_a.public_key());
+    let (dev_b, pk_b) = (id_b.device_id(), id_b.public_key());
+
+    let al_a = dir_a.join("trusted.json");
+    let al_b = dir_b.join("trusted.json");
+    Allowlist::load(&al_a).unwrap().add(dev_b, "B", &pk_b, now_ms()).unwrap();
+    Allowlist::load(&al_b).unwrap().add(dev_a, "A", &pk_a, now_ms()).unwrap();
+
+    // Start B first so its port is listening, then start A pointed at it via a
+    // static peer. No PeerEvent is ever sent on either side.
+    let (node_b, port_b) = start_node("B", id_b, al_b).await;
+    let (node_a, _port_a) = start_node_with_static(
+        "A",
+        id_a,
+        al_a,
+        vec![format!("127.0.0.1:{port_b}")],
+    )
+    .await;
+
+    // Session comes up purely from the static-peer connector.
+    let connected = wait_for(|| {
+        let a_up = node_a.engine.status().iter().any(|p| p.connected);
+        let b_up = node_b.engine.status().iter().any(|p| p.connected);
+        (a_up && b_up).then_some(())
+    })
+    .await;
+    assert!(connected.is_some(), "static peer was not dialed / did not connect");
+
+    // And clips flow over it.
+    node_a.handle.set("via-static");
+    let got = wait_for(|| node_b.handle.get().filter(|s| s == "via-static").map(|_| ())).await;
+    assert!(got.is_some(), "clip did not sync over the static-peer connection");
 }

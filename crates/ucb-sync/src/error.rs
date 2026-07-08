@@ -37,6 +37,11 @@ pub enum Error {
     #[error("peer not trusted: {0}")]
     UntrustedPeer(DeviceId),
 
+    /// The device has been revoked (tombstoned) and may not be re-added
+    /// without `ucb revoke --forget` (PAIR-7).
+    #[error("device {0} has been revoked; run `ucb revoke --forget <prefix>` to allow re-pairing")]
+    Tombstoned(DeviceId),
+
     /// Protocol version mismatch during the Hello exchange (SYNC-6).
     #[error("protocol version mismatch: local {local}, remote {remote}")]
     VersionMismatch { local: u16, remote: u16 },
