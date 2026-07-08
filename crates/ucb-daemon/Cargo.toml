@@ -14,6 +14,8 @@ ucb-crypto = { workspace = true }
 ucb-discovery = { workspace = true }
 ucb-clipboard = { workspace = true }
 ucb-sync = { workspace = true }
+ucb-files = { workspace = true }
+ucb-history = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

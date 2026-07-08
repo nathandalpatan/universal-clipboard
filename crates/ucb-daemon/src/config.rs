@@ -30,6 +30,10 @@ pub struct Config {
     /// Defaults to empty for configs written before this field existed.
     #[serde(default)]
     pub static_peers: Vec<String>,
+    /// Reject inbound file offers larger than this many bytes (FILE-6 policy).
+    /// `None` (the default) accepts any size.
+    #[serde(default)]
+    pub max_file_bytes: Option<u64>,
 }
 
 impl Config {
@@ -59,6 +63,12 @@ pub struct Paths {
     pub config_file: PathBuf,
     pub trusted_file: PathBuf,
     pub keys_dir: PathBuf,
+    /// Encrypted history database (HIST-1).
+    pub history_file: PathBuf,
+    /// Destination directory for inbound file transfers (FILE-6).
+    pub received_dir: PathBuf,
+    /// Unix socket the running daemon serves for status/send IPC (UX-1).
+    pub socket_file: PathBuf,
 }
 
 impl Paths {
@@ -82,6 +92,9 @@ impl Paths {
             config_file: config_dir.join("config.json"),
             trusted_file: config_dir.join("trusted.json"),
             keys_dir: config_dir.join("keys"),
+            history_file: config_dir.join("history.db"),
+            received_dir: config_dir.join("received"),
+            socket_file: config_dir.join("daemon.sock"),
             config_dir,
         })
     }
@@ -122,11 +135,13 @@ mod tests {
             listen_port: DEFAULT_PORT,
             keystore: Keystore::File,
             static_peers: vec!["10.0.0.7:48521".into(), "192.168.1.5:9000".into()],
+            max_file_bytes: Some(1024),
         };
         config.save(&paths).unwrap();
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.static_peers, config.static_peers);
         assert_eq!(loaded.name, "Test");
+        assert_eq!(loaded.max_file_bytes, Some(1024));
     }
 
     #[test]

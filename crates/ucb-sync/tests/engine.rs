@@ -6,6 +6,7 @@
 
 use std::net::IpAddr;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::net::TcpListener;
@@ -15,6 +16,7 @@ use ucb_clipboard::{ClipboardService, MockClipboard, MockClipboardHandle};
 use ucb_core::{DeviceId, Platform};
 use ucb_crypto::{FileKeyStore, Identity};
 use ucb_discovery::{Peer, PeerEvent};
+use ucb_history::{History, HistoryQuery};
 use ucb_sync::{Allowlist, EngineConfig, SyncEngine};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
@@ -70,12 +72,30 @@ async fn start_node_with_static(
     allowlist_path: PathBuf,
     static_peers: Vec<String>,
 ) -> (Node, u16) {
+    start_node_full(name, identity, allowlist_path, static_peers, None, None).await
+}
+
+/// Full constructor exposing the Wave-2 knobs (history, file-size cap). The
+/// inbound-file directory is `<allowlist parent>/received`.
+async fn start_node_full(
+    name: &str,
+    identity: Identity,
+    allowlist_path: PathBuf,
+    static_peers: Vec<String>,
+    history: Option<std::sync::Arc<ucb_history::History>>,
+    max_file_bytes: Option<u64>,
+) -> (Node, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
 
     let (mock, handle) = MockClipboard::new();
     let (writer, clip_rx) = ClipboardService::start(mock, POLL);
     let (disc_tx, disc_rx) = mpsc::channel(16);
+
+    let received_dir = allowlist_path
+        .parent()
+        .unwrap()
+        .join("received");
 
     let engine = SyncEngine::start(
         EngineConfig {
@@ -84,6 +104,9 @@ async fn start_node_with_static(
             device_name: name.to_string(),
             platform: Platform::Linux,
             static_peers,
+            history,
+            received_dir,
+            max_file_bytes,
         },
         listener,
         writer,
@@ -456,4 +479,185 @@ async fn static_peer_is_dialed_without_discovery() {
     node_a.handle.set("via-static");
     let got = wait_for(|| node_b.handle.get().filter(|s| s == "via-static").map(|_| ())).await;
     assert!(got.is_some(), "clip did not sync over the static-peer connection");
+}
+
+// --- Wave 2: file transfer + history -------------------------------------
+
+/// Create two mutually-trusted identities with their allowlists populated.
+/// Returns each temp dir plus its identity.
+async fn trusted_pair(tag: &str) -> (PathBuf, PathBuf, Identity, Identity) {
+    let dir_a = temp_dir(&format!("{tag}-a"));
+    let dir_b = temp_dir(&format!("{tag}-b"));
+    let id_a = Identity::load_or_generate(&FileKeyStore::new(dir_a.join("keys"))).unwrap();
+    let id_b = Identity::load_or_generate(&FileKeyStore::new(dir_b.join("keys"))).unwrap();
+    let (dev_a, pk_a) = (id_a.device_id(), id_a.public_key());
+    let (dev_b, pk_b) = (id_b.device_id(), id_b.public_key());
+    Allowlist::load(dir_a.join("trusted.json"))
+        .unwrap()
+        .add(dev_b, "B", &pk_b, now_ms())
+        .unwrap();
+    Allowlist::load(dir_b.join("trusted.json"))
+        .unwrap()
+        .add(dev_a, "A", &pk_a, now_ms())
+        .unwrap();
+    (dir_a, dir_b, id_a, id_b)
+}
+
+/// Cross-advertise two nodes and wait until both report a live session.
+async fn link(node_a: &Node, port_a: u16, dev_a: DeviceId, node_b: &Node, port_b: u16, dev_b: DeviceId) {
+    node_a.disc_tx.send(peer_event(dev_b, "B", port_b)).await.unwrap();
+    node_b.disc_tx.send(peer_event(dev_a, "A", port_a)).await.unwrap();
+    let connected = wait_for(|| {
+        let a_up = node_a.engine.status().iter().any(|p| p.connected);
+        let b_up = node_b.engine.status().iter().any(|p| p.connected);
+        (a_up && b_up).then_some(())
+    })
+    .await;
+    assert!(connected.is_some(), "engines did not connect within timeout");
+}
+
+fn patterned(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// FILE-1/4/6: a ~600 KiB file sent A -> B arrives byte-identical in B's
+/// received dir, and B's clipboard holds the delivered file's path (the MVP
+/// clipboard-pointer behavior).
+#[tokio::test]
+async fn file_transfer_end_to_end() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("file").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    let (node_a, port_a) =
+        start_node_full("A", id_a, dir_a.join("trusted.json"), vec![], None, None).await;
+    let (node_b, port_b) =
+        start_node_full("B", id_b, dir_b.join("trusted.json"), vec![], None, None).await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    // ~600 KiB (not a chunk multiple) so the transfer spans multiple chunks.
+    let bytes = patterned(600 * 1024 + 123);
+    let src = dir_a.join("payload.bin");
+    tokio::fs::write(&src, &bytes).await.unwrap();
+
+    let report = node_a.engine.send_file(&src, None, None).await.unwrap();
+    assert!(report.ok, "transfer should succeed: {report:?}");
+    assert_eq!(report.bytes, bytes.len() as u64);
+
+    // B's clipboard should end up holding the received file's path.
+    let clip_path = wait_for(|| node_b.handle.get())
+        .await
+        .expect("B clipboard should hold the received-file path");
+    assert!(
+        clip_path.ends_with("payload.bin"),
+        "clipboard should hold the file path, got {clip_path}"
+    );
+    assert!(
+        clip_path.contains("received"),
+        "delivered file should live in the received dir, got {clip_path}"
+    );
+
+    // The pointed-to file must be byte-identical to the source.
+    let received = std::fs::read(&clip_path).unwrap();
+    assert_eq!(received, bytes, "received file must be byte-identical");
+
+    // And it must physically be under B's received dir.
+    let received_dir = dir_b.join("received");
+    assert!(received_dir.join("payload.bin").exists());
+}
+
+/// FILE-6 policy: an offer larger than the receiver's `max_file_bytes` is
+/// rejected with `FileReject`; the sender surfaces the rejection and no file
+/// lands in the received dir.
+#[tokio::test]
+async fn oversized_offer_is_rejected() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("reject").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    let (node_a, port_a) =
+        start_node_full("A", id_a, dir_a.join("trusted.json"), vec![], None, None).await;
+    // B caps inbound files at 1 KiB.
+    let (node_b, port_b) =
+        start_node_full("B", id_b, dir_b.join("trusted.json"), vec![], None, Some(1024)).await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    // A 50 KiB file exceeds B's cap.
+    let bytes = patterned(50 * 1024);
+    let src = dir_a.join("big.bin");
+    tokio::fs::write(&src, &bytes).await.unwrap();
+
+    let report = node_a.engine.send_file(&src, None, None).await.unwrap();
+    assert!(!report.ok, "oversized transfer must be rejected: {report:?}");
+    assert!(
+        report.detail.to_lowercase().contains("too large"),
+        "rejection detail should mention the size limit, got {:?}",
+        report.detail
+    );
+
+    // Nothing should have been written into B's received dir.
+    let received_dir = dir_b.join("received");
+    if received_dir.exists() {
+        let leftovers: Vec<_> = std::fs::read_dir(&received_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name() != std::ffi::OsStr::new("."))
+            .collect();
+        assert!(leftovers.is_empty(), "received dir should be empty, has {leftovers:?}");
+    }
+    // And B's clipboard must be untouched.
+    assert_eq!(node_b.handle.get(), None, "B clipboard must not change on reject");
+}
+
+/// HIST-1/3: a clip synced A -> B is recorded in *both* engines' history with
+/// the originating device as the origin.
+#[tokio::test]
+async fn history_recorded_on_both_sides() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("hist").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+
+    let hist_a = Arc::new(History::open(&dir_a.join("history.db"), &FileKeyStore::new(dir_a.join("hkeys"))).unwrap());
+    let hist_b = Arc::new(History::open(&dir_b.join("history.db"), &FileKeyStore::new(dir_b.join("hkeys"))).unwrap());
+
+    let (node_a, port_a) = start_node_full(
+        "A",
+        id_a,
+        dir_a.join("trusted.json"),
+        vec![],
+        Some(hist_a.clone()),
+        None,
+    )
+    .await;
+    let (node_b, port_b) = start_node_full(
+        "B",
+        id_b,
+        dir_b.join("trusted.json"),
+        vec![],
+        Some(hist_b.clone()),
+        None,
+    )
+    .await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    node_a.handle.set("shared-clip");
+    // Wait until B applies it to its clipboard.
+    let got = wait_for(|| node_b.handle.get().filter(|s| s == "shared-clip").map(|_| ())).await;
+    assert!(got.is_some(), "clip did not sync A -> B");
+
+    let find = |hist: &History| -> Option<ucb_history::HistoryEntry> {
+        hist.list(HistoryQuery {
+            text_search: Some("shared-clip".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .next()
+    };
+
+    // A recorded its own local copy; origin is A.
+    let a_entry = wait_for(|| find(&hist_a)).await.expect("A should record the clip");
+    assert_eq!(a_entry.content.as_deref(), Some("shared-clip"));
+    assert_eq!(a_entry.origin_id, dev_a.to_string(), "A's record origin must be A");
+
+    // B recorded the applied remote clip; origin is still A (the producer).
+    let b_entry = wait_for(|| find(&hist_b)).await.expect("B should record the clip");
+    assert_eq!(b_entry.content.as_deref(), Some("shared-clip"));
+    assert_eq!(b_entry.origin_id, dev_a.to_string(), "B's record origin must be A");
+    assert_eq!(b_entry.origin_name, "A", "B records the sender's display name");
 }
