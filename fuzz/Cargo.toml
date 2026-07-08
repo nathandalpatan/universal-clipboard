@@ -1,0 +1,33 @@
+[package]
+name = "ucb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+# Detach this crate from the parent cargo workspace: cargo-fuzz builds it as a
+# standalone project so it must NOT be pulled in as a workspace member (and the
+# parent workspace must not try to build it under nightly instrumentation).
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+# The parser under test. Referenced by path so the fuzzer always tracks the
+# in-tree ucb-core (no version pinning needed).
+ucb-core = { path = "../crates/ucb-core" }
+
+[[bin]]
+name = "fuzz_wire_decode"
+path = "fuzz_targets/fuzz_wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_payload_hash"
+path = "fuzz_targets/fuzz_payload_hash.rs"
+test = false
+doc = false
+bench = false

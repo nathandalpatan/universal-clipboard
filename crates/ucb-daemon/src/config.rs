@@ -26,6 +26,10 @@ pub struct Config {
     pub name: String,
     pub listen_port: u16,
     pub keystore: Keystore,
+    /// Manually configured always-present peers (DISC-3), each `"ip:port"`.
+    /// Defaults to empty for configs written before this field existed.
+    #[serde(default)]
+    pub static_peers: Vec<String>,
 }
 
 impl Config {
@@ -58,12 +62,22 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// Resolve the platform config directory for
-    /// `ProjectDirs("dev", "ucb", "universal-clipboard")`.
-    pub fn resolve() -> Result<Self> {
-        let dirs = ProjectDirs::from("dev", "ucb", "universal-clipboard")
-            .ok_or_else(|| anyhow!("could not determine a config directory for this platform"))?;
-        let config_dir = dirs.config_dir().to_path_buf();
+    /// Resolve the daemon's filesystem layout.
+    ///
+    /// With `override_dir = Some(dir)` every file lives directly under `dir`
+    /// (the global `--config-dir` flag; makes the daemon fully sandboxable for
+    /// tests and the Docker harness). With `None` it falls back to the platform
+    /// config directory for `ProjectDirs("dev", "ucb", "universal-clipboard")`.
+    pub fn resolve(override_dir: Option<PathBuf>) -> Result<Self> {
+        let config_dir = match override_dir {
+            Some(dir) => dir,
+            None => {
+                let dirs = ProjectDirs::from("dev", "ucb", "universal-clipboard").ok_or_else(
+                    || anyhow!("could not determine a config directory for this platform"),
+                )?;
+                dirs.config_dir().to_path_buf()
+            }
+        };
         Ok(Self {
             config_file: config_dir.join("config.json"),
             trusted_file: config_dir.join("trusted.json"),
@@ -78,5 +92,54 @@ pub fn build_keystore(config: &Config, paths: &Paths) -> Box<dyn KeyStore> {
     match config.keystore {
         Keystore::Keyring => Box::new(KeyringStore::new()),
         Keystore::File => Box::new(FileKeyStore::new(paths.keys_dir.clone())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ucb-daemon-cfg-{}-{}-{}",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_round_trips_static_peers() {
+        let dir = temp_dir("roundtrip");
+        let paths = Paths::resolve(Some(dir)).unwrap();
+        let config = Config {
+            name: "Test".into(),
+            listen_port: DEFAULT_PORT,
+            keystore: Keystore::File,
+            static_peers: vec!["10.0.0.7:48521".into(), "192.168.1.5:9000".into()],
+        };
+        config.save(&paths).unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert_eq!(loaded.static_peers, config.static_peers);
+        assert_eq!(loaded.name, "Test");
+    }
+
+    #[test]
+    fn config_without_static_peers_defaults_empty() {
+        let dir = temp_dir("legacy");
+        let paths = Paths::resolve(Some(dir)).unwrap();
+        // Simulate a config written before `static_peers` existed.
+        std::fs::write(
+            &paths.config_file,
+            br#"{"name":"Old","listen_port":48521,"keystore":"keyring"}"#,
+        )
+        .unwrap();
+        let loaded = Config::load(&paths).unwrap();
+        assert!(loaded.static_peers.is_empty());
     }
 }

@@ -20,13 +20,17 @@
 //! The group is capped at [`ucb_core::MAX_DEVICES`] *including this device*, so
 //! at most `MAX_DEVICES - 1` remote entries may be stored (PAIR-5).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use ucb_core::{DeviceId, MAX_DEVICES};
 
 use crate::error::{Error, Result};
+
+/// File name (sibling of `trusted.json`) holding the revocation tombstone list
+/// (PAIR-7).
+const TOMBSTONE_FILE: &str = "revoked.json";
 
 /// One persisted allowlist entry, as stored on disk (hex-encoded key material).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,11 +52,19 @@ pub struct TrustedDevice {
 
 /// The persistent allowlist. Load with [`Allowlist::load`]; mutations persist
 /// atomically to the backing file as they happen.
+///
+/// Alongside the trust map the allowlist owns a revocation *tombstone* set
+/// (PAIR-7), persisted to a sibling `revoked.json`. A tombstoned device may not
+/// be re-added ([`Allowlist::add`] fails) until it is [`forget`](Allowlist::forget).
 #[derive(Debug)]
 pub struct Allowlist {
     path: PathBuf,
+    /// Sibling `revoked.json` path.
+    tombstone_path: PathBuf,
     /// device-id-hex -> entry. A `BTreeMap` gives deterministic file ordering.
     map: BTreeMap<String, StoredEntry>,
+    /// Revoked device ids (hex). A `BTreeSet` gives deterministic file ordering.
+    tombstones: BTreeSet<String>,
 }
 
 impl Allowlist {
@@ -67,7 +79,19 @@ impl Allowlist {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
             Err(e) => return Err(Error::Io(e)),
         };
-        Ok(Self { path, map })
+        let tombstone_path = path.with_file_name(TOMBSTONE_FILE);
+        let tombstones = match std::fs::read(&tombstone_path) {
+            Ok(bytes) if bytes.is_empty() => BTreeSet::new(),
+            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeSet::new(),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        Ok(Self {
+            path,
+            tombstone_path,
+            map,
+            tombstones,
+        })
     }
 
     /// True if `id` is a trusted peer.
@@ -99,6 +123,10 @@ impl Allowlist {
         added_ts_ms: u64,
     ) -> Result<()> {
         let key = id.to_string();
+        // PAIR-7: a revoked device may never be re-added while tombstoned.
+        if self.tombstones.contains(&key) {
+            return Err(Error::Tombstoned(id));
+        }
         let is_new = !self.map.contains_key(&key);
         // MAX_DEVICES counts this device, so remote entries are capped one below.
         if is_new && self.map.len() >= MAX_DEVICES - 1 {
@@ -133,6 +161,65 @@ impl Allowlist {
     pub fn resolve_prefix(&self, prefix: &str) -> Option<DeviceId> {
         let prefix = prefix.to_lowercase();
         let mut matches = self.map.keys().filter(|k| k.starts_with(&prefix));
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            return None; // ambiguous
+        }
+        decode_device_id(first)
+    }
+
+    // --- revocation / tombstones (PAIR-7) ---------------------------------
+
+    /// True if `id` has been revoked (tombstoned) and may not be re-added.
+    pub fn is_tombstoned(&self, id: &DeviceId) -> bool {
+        self.tombstones.contains(&id.to_string())
+    }
+
+    /// Revoke `id`: remove it from the allowlist (if present) and record a
+    /// tombstone. Both files are persisted atomically. Returns `true` iff the
+    /// tombstone was *newly* added (i.e. the device was not already revoked);
+    /// this makes the operation idempotent so remote `Revoke` messages never
+    /// loop.
+    ///
+    /// Used both by the `ucb revoke` CLI (local revocation) and by the engine
+    /// when it receives a `Revoke` from a trusted peer.
+    pub fn revoke(&mut self, id: DeviceId) -> Result<bool> {
+        let key = id.to_string();
+        let removed_entry = self.map.remove(&key).is_some();
+        let newly = self.tombstones.insert(key);
+        if removed_entry {
+            self.save()?;
+        }
+        if newly {
+            self.save_tombstones()?;
+        }
+        Ok(newly)
+    }
+
+    /// Clear a tombstone (`ucb revoke --forget`), allowing the device to be
+    /// paired again in the future. Returns whether a tombstone was present.
+    pub fn forget(&mut self, id: &DeviceId) -> Result<bool> {
+        let removed = self.tombstones.remove(&id.to_string());
+        if removed {
+            self.save_tombstones()?;
+        }
+        Ok(removed)
+    }
+
+    /// All tombstoned device ids, decoded. Used by the engine to broadcast
+    /// `Revoke` for each at session start / on the periodic re-check.
+    pub fn tombstones(&self) -> Vec<DeviceId> {
+        self.tombstones
+            .iter()
+            .filter_map(|k| decode_device_id(k))
+            .collect()
+    }
+
+    /// Resolve a device-id hex *prefix* against the tombstone list (used by
+    /// `ucb revoke --forget`).
+    pub fn resolve_tombstone_prefix(&self, prefix: &str) -> Option<DeviceId> {
+        let prefix = prefix.to_lowercase();
+        let mut matches = self.tombstones.iter().filter(|k| k.starts_with(&prefix));
         let first = matches.next()?;
         if matches.next().is_some() {
             return None; // ambiguous
@@ -183,6 +270,22 @@ impl Allowlist {
         let tmp = self.path.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp, &json)?;
         std::fs::rename(&tmp, &self.path)?;
+        Ok(())
+    }
+
+    /// Atomically write the tombstone set to `revoked.json` (temp + rename).
+    fn save_tombstones(&self) -> Result<()> {
+        if let Some(parent) = self.tombstone_path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)?;
+            }
+        }
+        let json = serde_json::to_vec_pretty(&self.tombstones)?;
+        let tmp = self
+            .tombstone_path
+            .with_extension(format!("tmp.{}", std::process::id()));
+        std::fs::write(&tmp, &json)?;
+        std::fs::rename(&tmp, &self.tombstone_path)?;
         Ok(())
     }
 }

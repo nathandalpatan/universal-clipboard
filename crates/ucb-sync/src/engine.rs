@@ -49,6 +49,7 @@ use ucb_discovery::PeerEvent;
 use crate::allowlist::Allowlist;
 use crate::error::{Error, Result};
 use crate::now_ms;
+use crate::queue::OfflineQueue;
 use crate::rate_limit::TokenBucketLimiter;
 
 /// Reconnect backoff ceiling (DISC-4).
@@ -58,6 +59,21 @@ const BACKOFF_START: Duration = Duration::from_secs(1);
 /// Bound on a session's outbound queue; clipboard updates are last-write-wins,
 /// so a full queue simply drops the stale update.
 const OUTBOUND_QUEUE: usize = 64;
+/// How often the engine re-reads `revoked.json` and re-broadcasts tombstones to
+/// live peers (PAIR-7). Because `ucb revoke` runs as a separate process, live
+/// revocation propagation has an up-to-this-interval lag.
+const REVOCATION_RECHECK: Duration = Duration::from_secs(30);
+/// Window in which inbound clips at session start are counted as "synced while
+/// away" for the UX-4 receiver-side notice.
+const SYNCED_AWAY_WINDOW: Duration = Duration::from_secs(5);
+
+/// One thing to send out on a session: a live/queued clip, or a revocation
+/// broadcast (PAIR-7).
+#[derive(Clone)]
+enum Outbound {
+    Clip(ClipboardItem),
+    Revoke(DeviceId),
+}
 
 /// A snapshot of one trusted peer's connection state, for the CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,6 +93,10 @@ pub struct EngineConfig {
     pub device_name: String,
     /// This device's platform, sent in `Hello`.
     pub platform: Platform,
+    /// Manually configured always-present peer endpoints, each `"ip:port"`
+    /// (DISC-3). Dialed with the reconnect backoff regardless of device-id
+    /// ordering; trust is still verified by the handshake + allowlist.
+    pub static_peers: Vec<String>,
 }
 
 /// A live session's outbound handle.
@@ -84,7 +104,7 @@ struct SessionEntry {
     /// Distinguishes concurrent sessions for the same peer so a closing session
     /// never deregisters a newer one.
     token: u64,
-    tx: mpsc::Sender<ClipboardItem>,
+    tx: mpsc::Sender<Outbound>,
 }
 
 /// The last-known network endpoint for a discovered peer.
@@ -101,7 +121,12 @@ struct Shared {
     name: String,
     platform: Platform,
     writer: ClipboardWriter,
+    /// Path to `trusted.json`; re-read on the periodic tombstone re-check so the
+    /// running engine picks up an out-of-process `ucb revoke` (PAIR-7).
+    allowlist_path: std::path::PathBuf,
     allowlist: Mutex<Allowlist>,
+    /// Per-peer offline queue (SYNC-5), persisted next to the allowlist.
+    queue: Mutex<OfflineQueue>,
     latest: Mutex<Option<ClipboardItem>>,
     sessions: Mutex<HashMap<DeviceId, SessionEntry>>,
     peers: Mutex<HashMap<DeviceId, Endpoint>>,
@@ -135,6 +160,9 @@ impl SyncEngine {
         let identity = Arc::new(config.identity);
         let self_id = identity.device_id();
         let allowlist = Allowlist::load(&config.allowlist_path)?;
+        // SYNC-5: the offline queue lives next to the allowlist (`queue.json`).
+        let queue_path = config.allowlist_path.with_file_name("queue.json");
+        let queue = OfflineQueue::load(queue_path)?;
 
         let shared = Arc::new(Shared {
             identity,
@@ -142,7 +170,9 @@ impl SyncEngine {
             name: config.device_name,
             platform: config.platform,
             writer,
+            allowlist_path: config.allowlist_path,
             allowlist: Mutex::new(allowlist),
+            queue: Mutex::new(queue),
             latest: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -151,11 +181,17 @@ impl SyncEngine {
             token_ctr: AtomicU64::new(0),
         });
 
-        let tasks = vec![
+        let mut tasks = vec![
             tokio::spawn(shared.clone().accept_loop(listener)),
             tokio::spawn(shared.clone().local_clip_loop(clip_rx)),
             tokio::spawn(shared.clone().discovery_loop(disc_rx)),
+            tokio::spawn(shared.clone().revocation_loop()),
         ];
+
+        // DISC-3: one always-present connector per configured static peer.
+        for addr in config.static_peers {
+            tasks.push(tokio::spawn(shared.clone().static_connector(addr)));
+        }
 
         Ok(Self { shared, tasks })
     }
@@ -296,6 +332,47 @@ impl Shared {
         tracing::debug!(peer = %peer_id.short(), "connector stopped (peer lost)");
     }
 
+    // --- static peers (DISC-3) --------------------------------------------
+
+    /// Dial a static peer at `addr`, verify trust, and run one session. Unlike
+    /// discovery-driven dialing this ignores the device-id ordering rule (the
+    /// static peer is always dialed); identity is verified by the handshake +
+    /// allowlist exactly as usual.
+    async fn dial_addr_and_run(self: Arc<Self>, addr: String) -> Result<()> {
+        let stream = TcpStream::connect(&addr).await?;
+        let mut chan = handshake_initiator(stream, self.identity.as_ref()).await?;
+        let remote_id = chan.remote_device_id();
+
+        if !self.is_trusted(&remote_id, chan.remote_static_pubkey()) {
+            return Err(Error::UntrustedPeer(remote_id));
+        }
+        // Avoid a duplicate session if discovery already connected this peer.
+        if self.sessions.lock().unwrap().contains_key(&remote_id) {
+            return Ok(());
+        }
+
+        let peer = self.hello_exchange(&mut chan).await?;
+        self.run_session(chan, remote_id, peer.name).await;
+        Ok(())
+    }
+
+    /// A static-peer connector (DISC-3): dial `addr` forever with capped
+    /// exponential backoff. A static peer is treated as always present, so
+    /// (unlike [`connector`](Self::connector)) there is no `PeerLost` to stop it.
+    async fn static_connector(self: Arc<Self>, addr: String) {
+        let mut backoff = BACKOFF_START;
+        loop {
+            match self.clone().dial_addr_and_run(addr.clone()).await {
+                Ok(()) => backoff = BACKOFF_START,
+                Err(e) => {
+                    tracing::debug!(peer = %addr, error = %e, "static dial attempt failed");
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(BACKOFF_CAP);
+        }
+    }
+
     // --- shared session machinery -----------------------------------------
 
     /// Send our `Hello` and read the peer's, enforcing the version check
@@ -344,7 +421,7 @@ impl Shared {
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let token = self.next_token();
-        let (out_tx, mut out_rx) = mpsc::channel::<ClipboardItem>(OUTBOUND_QUEUE);
+        let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
         self.sessions
             .lock()
             .unwrap()
@@ -354,13 +431,59 @@ impl Shared {
         let mut guard = ReplayGuard::new();
         let mut out_seq: u64 = 0;
 
+        // PAIR-7: re-read revoked.json (catches an out-of-process `ucb revoke`)
+        // and send a Revoke for every tombstone so a formerly-offline third
+        // device still learns about revocations.
+        let tombstones = self.refresh_from_disk();
+        for device in &tombstones {
+            if chan.send(&WireMessage::Revoke { device: *device }).await.is_err() {
+                self.deregister_session(&peer_id, token);
+                return;
+            }
+        }
+
+        // SYNC-5: drain the offline queue in order before live flow. Each item
+        // goes out as a fresh Clip with a new session seq.
+        let queued = match self.queue.lock().unwrap().drain(&peer_id, now_ms()) {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to drain offline queue");
+                Vec::new()
+            }
+        };
+        let drained = queued.len();
+        for item in queued {
+            if chan.send(&WireMessage::Clip { seq: out_seq, item }).await.is_err() {
+                self.deregister_session(&peer_id, token);
+                return;
+            }
+            out_seq += 1;
+        }
+        if drained > 0 {
+            // UX-4 (sender side): what we flushed to a peer that was away.
+            tracing::info!(count = drained, name = %peer_name, "synced {drained} items to {peer_name} while away");
+        }
+
+        // UX-4 (receiver side): count clips applied in the first few seconds of
+        // the session and emit a "synced N items while away from <name>" notice
+        // (the CLI toast equivalent; a GUI toast is future work).
+        let mut early_applied: u32 = 0;
+        let settle = tokio::time::sleep(SYNCED_AWAY_WINDOW);
+        tokio::pin!(settle);
+        let mut settled = false;
+
         loop {
             tokio::select! {
                 inbound = chan.recv() => {
                     match inbound {
                         Ok(msg) => {
-                            if self.handle_inbound_msg(&mut chan, &mut guard, msg).await.is_err() {
-                                break;
+                            match self.handle_inbound_msg(&mut chan, &mut guard, msg).await {
+                                Ok(applied) => {
+                                    if applied && !settled {
+                                        early_applied += 1;
+                                    }
+                                }
+                                Err(_) => break,
                             }
                         }
                         Err(e) => {
@@ -371,9 +494,15 @@ impl Shared {
                 }
                 outbound = out_rx.recv() => {
                     match outbound {
-                        Some(item) => {
-                            let msg = WireMessage::Clip { seq: out_seq, item };
-                            out_seq += 1;
+                        Some(out) => {
+                            let msg = match out {
+                                Outbound::Clip(item) => {
+                                    let m = WireMessage::Clip { seq: out_seq, item };
+                                    out_seq += 1;
+                                    m
+                                }
+                                Outbound::Revoke(device) => WireMessage::Revoke { device },
+                            };
                             if let Err(e) = chan.send(&msg).await {
                                 tracing::debug!(peer = %peer_id.short(), error = %e, "session write failed");
                                 break;
@@ -382,25 +511,38 @@ impl Shared {
                         None => break, // engine dropped our sender
                     }
                 }
+                _ = &mut settle, if !settled => {
+                    settled = true;
+                    if early_applied > 0 {
+                        tracing::info!(count = early_applied, name = %peer_name, "synced {early_applied} items while away from {peer_name}");
+                    }
+                }
             }
         }
 
-        // Deregister only if we are still the current session for this peer.
-        let mut sessions = self.sessions.lock().unwrap();
-        if sessions.get(&peer_id).map(|e| e.token) == Some(token) {
-            sessions.remove(&peer_id);
-        }
+        self.deregister_session(&peer_id, token);
         tracing::info!(peer = %peer_id.short(), "session closed");
     }
 
-    /// Handle one decrypted inbound message. Returns `Err` only to signal the
-    /// session should end (write failure); dropped clips return `Ok`.
+    /// Deregister a session, but only if we are still the current session for
+    /// this peer (a newer session must never be evicted by an older one closing).
+    fn deregister_session(&self, peer_id: &DeviceId, token: u64) {
+        let mut sessions = self.sessions.lock().unwrap();
+        if sessions.get(peer_id).map(|e| e.token) == Some(token) {
+            sessions.remove(peer_id);
+        }
+    }
+
+    /// Handle one decrypted inbound message. Returns `Ok(true)` if an incoming
+    /// clip was applied to the clipboard (used for the UX-4 "synced while away"
+    /// counter), `Ok(false)` for anything else. Returns `Err` only to signal the
+    /// session should end.
     async fn handle_inbound_msg<S>(
         &self,
         chan: &mut SecureChannel<S>,
         guard: &mut ReplayGuard,
         msg: WireMessage,
-    ) -> Result<()>
+    ) -> Result<bool>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -408,11 +550,11 @@ impl Shared {
             WireMessage::Clip { seq, item } => {
                 if let Err(e) = guard.check(seq) {
                     tracing::warn!(error = %e, "dropping replayed/out-of-order clip");
-                    return Ok(());
+                    return Ok(false);
                 }
                 if let Err(e) = check_clock_skew(item.ts_ms, now_ms()) {
                     tracing::warn!(error = %e, "dropping clip with excessive clock skew");
-                    return Ok(());
+                    return Ok(false);
                 }
                 // Conflict resolution (SYNC-3): apply only if it wins.
                 let apply = {
@@ -424,23 +566,36 @@ impl Shared {
                         tracing::warn!(error = %e, "failed to write clip to clipboard");
                     }
                 }
-                Ok(())
+                Ok(apply)
             }
             WireMessage::Ping => {
                 let _ = chan.send(&WireMessage::Pong).await;
-                Ok(())
+                Ok(false)
             }
-            WireMessage::Pong => Ok(()),
-            WireMessage::Hello { .. } => Ok(()), // already exchanged; ignore
+            WireMessage::Pong => Ok(false),
+            WireMessage::Hello { .. } => Ok(false), // already exchanged; ignore
             WireMessage::Reject { reason } => {
                 tracing::info!(reason = %reason, "peer sent Reject; closing session");
                 Err(Error::Rejected(reason))
             }
-            // Protocol v2 messages (PAIR-7 revocation, FILE transfer) are
-            // handled by the expansion work; ignore until wired in.
-            other => {
-                tracing::debug!(?other, "unhandled v2 message; ignoring");
-                Ok(())
+            // PAIR-7: a trusted, live peer tells us it revoked `device`. We are
+            // inside an established session, so the sender is trusted. Remove
+            // `device` from our own allowlist, tombstone it, and drop its
+            // session. `apply_revocation` is idempotent (already-tombstoned ->
+            // no-op), so this never loops back around the group.
+            WireMessage::Revoke { device } => {
+                self.apply_revocation(device);
+                Ok(false)
+            }
+            // File* messages are wired in by a later integration wave; ignore
+            // them (with their frames already decrypted) until then.
+            WireMessage::FileOffer { .. }
+            | WireMessage::FileAccept { .. }
+            | WireMessage::FileReject { .. }
+            | WireMessage::FileChunk { .. }
+            | WireMessage::FileDone { .. } => {
+                tracing::debug!("ignoring File* message (not yet wired in)");
+                Ok(false)
             }
         }
     }
@@ -457,17 +612,37 @@ impl Shared {
             // A local copy is the freshest user intent: record it as latest.
             *self.latest.lock().unwrap() = Some(item.clone());
 
-            // Snapshot senders, then send outside the lock.
-            let sinks: Vec<mpsc::Sender<ClipboardItem>> = self
+            // Snapshot live sessions, then send outside the lock.
+            let live: HashMap<DeviceId, mpsc::Sender<Outbound>> = self
                 .sessions
                 .lock()
                 .unwrap()
-                .values()
-                .map(|e| e.tx.clone())
+                .iter()
+                .map(|(id, e)| (*id, e.tx.clone()))
                 .collect();
-            for tx in sinks {
+            for tx in live.values() {
                 // Drop rather than block if a peer's queue is backed up.
-                let _ = tx.try_send(item.clone());
+                let _ = tx.try_send(Outbound::Clip(item.clone()));
+            }
+
+            // SYNC-5: buffer this clip for every trusted peer that is currently
+            // offline (no live session, not tombstoned).
+            let offline: Vec<DeviceId> = {
+                let allowlist = self.allowlist.lock().unwrap();
+                allowlist
+                    .list()
+                    .into_iter()
+                    .map(|d| d.device_id)
+                    .filter(|id| !live.contains_key(id) && !allowlist.is_tombstoned(id))
+                    .collect()
+            };
+            if !offline.is_empty() {
+                let mut queue = self.queue.lock().unwrap();
+                for id in offline {
+                    if let Err(e) = queue.enqueue(&id, item.clone(), item.ts_ms) {
+                        tracing::warn!(error = %e, "failed to enqueue offline clip");
+                    }
+                }
             }
         }
     }
@@ -508,11 +683,100 @@ impl Shared {
         }
     }
 
-    /// True if `id` is trusted *and* the presented static key matches what we
-    /// stored (defends against a device-id record whose key was tampered).
+    /// True if `id` is trusted, not tombstoned, *and* the presented static key
+    /// matches what we stored (defends against a device-id record whose key was
+    /// tampered, and rejects a revoked device even if somehow still listed).
     fn is_trusted(&self, id: &DeviceId, presented_pubkey: [u8; 32]) -> bool {
         let allowlist = self.allowlist.lock().unwrap();
-        allowlist.is_trusted(id) && allowlist.pubkey_of(id) == Some(presented_pubkey)
+        !allowlist.is_tombstoned(id)
+            && allowlist.is_trusted(id)
+            && allowlist.pubkey_of(id) == Some(presented_pubkey)
+    }
+
+    // --- revocation propagation (PAIR-7) ----------------------------------
+
+    /// Reload the allowlist (and its tombstone set) from disk so an
+    /// out-of-process `ucb revoke` takes effect in the running engine, then
+    /// drop any live session / connector for a now-tombstoned peer. Returns the
+    /// current tombstone list.
+    fn refresh_from_disk(&self) -> Vec<DeviceId> {
+        let tombstones = match Allowlist::load(&self.allowlist_path) {
+            Ok(fresh) => {
+                let tombstones = fresh.tombstones();
+                *self.allowlist.lock().unwrap() = fresh;
+                tombstones
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to reload allowlist for revocation re-check");
+                self.allowlist.lock().unwrap().tombstones()
+            }
+        };
+        for id in &tombstones {
+            self.drop_peer(id);
+        }
+        tombstones
+    }
+
+    /// Drop any live session and stop any connector for `id` (used when a peer
+    /// becomes revoked).
+    fn drop_peer(&self, id: &DeviceId) {
+        // Removing the SessionEntry drops its outbound sender, which ends the
+        // peer's `run_session` on its next `out_rx.recv()`.
+        self.sessions.lock().unwrap().remove(id);
+        if let Some(present) = self.connectors.lock().unwrap().remove(id) {
+            present.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Apply a revocation learned from a trusted peer (or locally): remove the
+    /// device from the allowlist, tombstone it, and drop its session. Idempotent
+    /// — an already-tombstoned device is a no-op, which prevents `Revoke`
+    /// messages from looping around the group. Returns whether it was newly
+    /// applied.
+    fn apply_revocation(&self, device: DeviceId) -> bool {
+        let newly = match self.allowlist.lock().unwrap().revoke(device) {
+            Ok(newly) => newly,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to record revocation");
+                false
+            }
+        };
+        if newly {
+            tracing::info!(revoked = %device.short(), "device revoked by a trusted peer; removed from allowlist");
+            self.drop_peer(&device);
+        }
+        newly
+    }
+
+    /// Send a `Revoke` for each tombstoned device to every live session.
+    fn broadcast_revocations(&self, tombstones: &[DeviceId]) {
+        if tombstones.is_empty() {
+            return;
+        }
+        let sinks: Vec<mpsc::Sender<Outbound>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.tx.clone())
+            .collect();
+        for tx in sinks {
+            for device in tombstones {
+                let _ = tx.try_send(Outbound::Revoke(*device));
+            }
+        }
+    }
+
+    /// Periodic PAIR-7 re-check: every [`REVOCATION_RECHECK`], re-read
+    /// `revoked.json` (to pick up an out-of-process `ucb revoke`) and
+    /// re-broadcast tombstones to connected peers. Live propagation therefore
+    /// lags by up to one interval.
+    async fn revocation_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(REVOCATION_RECHECK).await;
+            let tombstones = self.refresh_from_disk();
+            self.broadcast_revocations(&tombstones);
+        }
     }
 }
 

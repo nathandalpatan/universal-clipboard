@@ -1,0 +1,43 @@
+# TEST-1: two ucb devices on one bridge network for the integration harness.
+#
+# `alpha` and `beta` are identical containers built from docker/Dockerfile; the
+# harness (scripts/harness-test.sh) drives them via `docker compose exec`.
+#
+# NET_ADMIN is required so scripts/netem.sh can apply `tc qdisc` disciplines
+# (TEST-2 fault injection) inside the containers.
+#
+# NOTE: the build context is the workspace root (..) so the Dockerfile can copy
+# Cargo.toml / Cargo.lock / crates/. Run compose from the docker/ dir, or pass
+# `-f docker/docker-compose.yml` from the repo root (the harness does the latter).
+
+services:
+  alpha:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ucb-daemon:harness
+    container_name: ucb-alpha
+    hostname: alpha
+    networks:
+      - ucbnet
+    cap_add:
+      - NET_ADMIN
+    # Give the shared build a stable name so beta reuses it instead of rebuilding.
+    init: true
+
+  beta:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ucb-daemon:harness
+    container_name: ucb-beta
+    hostname: beta
+    networks:
+      - ucbnet
+    cap_add:
+      - NET_ADMIN
+    init: true
+
+networks:
+  ucbnet:
+    driver: bridge
