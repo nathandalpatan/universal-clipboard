@@ -1,10 +1,11 @@
 //! Status / send IPC between a running `ucb run` daemon and short-lived CLI
 //! invocations (`ucb status`, `ucb send`) — UX-1.
 //!
-//! Transport: a unix domain socket at `<config-dir>/daemon.sock` (mode 0600).
-//! Framing: newline-delimited JSON. A client writes exactly one [`Request`]
-//! line, then reads one or more response lines until the server closes the
-//! connection:
+//! Transport: a unix domain socket at `<config-dir>/daemon.sock` (mode 0600)
+//! on Unix; a named pipe derived from that same path on Windows, where unix
+//! domain sockets aren't available. Framing: newline-delimited JSON. A
+//! client writes exactly one [`Request`] line, then reads one or more
+//! response lines until the server closes the connection:
 //!
 //! * `{"cmd":"status"}` → a single [`StatusResponse`] line.
 //! * `{"cmd":"send","path":"...","to":null|"prefix"}` → zero or more
@@ -16,11 +17,22 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
 use ucb_core::{DeviceId, PROTOCOL_VERSION};
 use ucb_sync::{SendProgress, SyncEngine};
+
+#[cfg(unix)]
+type IpcStream = UnixStream;
+#[cfg(windows)]
+type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+#[cfg(unix)]
+pub type Listener = UnixListener;
+#[cfg(windows)]
+pub type Listener = windows_pipe::PipeListener;
 
 /// A command sent by a CLI client to the running daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,23 +90,28 @@ pub enum SendUpdate {
 // ---------------------------------------------------------------------------
 
 /// Bind the IPC socket, replacing any stale file, and set it to mode 0600.
+#[cfg(unix)]
 pub fn bind(socket_path: &Path) -> Result<UnixListener> {
     // A leftover socket from a previous run would make bind() fail with
     // EADDRINUSE; remove it first (it is safe — we hold the config dir).
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding IPC socket at {}", socket_path.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
-            .with_context(|| format!("securing IPC socket at {}", socket_path.display()))?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("securing IPC socket at {}", socket_path.display()))?;
     Ok(listener)
+}
+
+/// Bind the IPC named pipe (Windows has no unix domain sockets).
+#[cfg(windows)]
+pub fn bind(socket_path: &Path) -> Result<Listener> {
+    Listener::bind(socket_path)
 }
 
 /// Accept and serve IPC connections until the listener is dropped. Each
 /// connection is handled on its own task.
+#[cfg(unix)]
 pub async fn serve(listener: UnixListener, engine: Arc<SyncEngine>) {
     loop {
         match listener.accept().await {
@@ -114,8 +131,33 @@ pub async fn serve(listener: UnixListener, engine: Arc<SyncEngine>) {
     }
 }
 
-async fn handle_conn(stream: UnixStream, engine: Arc<SyncEngine>) -> Result<()> {
-    let (read_half, mut write_half) = stream.into_split();
+/// Accept and serve IPC connections until the listener stops producing new
+/// pipe instances. Each connection is handled on its own task.
+#[cfg(windows)]
+pub async fn serve(mut listener: Listener, engine: Arc<SyncEngine>) {
+    loop {
+        match listener.accept().await {
+            Ok(stream) => {
+                let engine = engine.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = handle_conn(stream, engine).await {
+                        tracing::debug!(error = %e, "IPC connection ended with error");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "IPC accept failed");
+                return;
+            }
+        }
+    }
+}
+
+async fn handle_conn<S>(stream: S, engine: Arc<SyncEngine>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     if reader.read_line(&mut line).await? == 0 {
@@ -258,7 +300,8 @@ where
 
 /// Connect to the daemon socket, translating a missing/refused socket into a
 /// clear "is the daemon running?" error.
-async fn connect(socket_path: &Path) -> Result<UnixStream> {
+#[cfg(unix)]
+async fn connect(socket_path: &Path) -> Result<IpcStream> {
     UnixStream::connect(socket_path).await.map_err(|e| {
         anyhow!(
             "could not reach the daemon at {} ({e}). Is `ucb run` active?",
@@ -267,10 +310,22 @@ async fn connect(socket_path: &Path) -> Result<UnixStream> {
     })
 }
 
+/// Connect to the daemon's named pipe, translating a missing/refused pipe
+/// into a clear "is the daemon running?" error.
+#[cfg(windows)]
+async fn connect(socket_path: &Path) -> Result<IpcStream> {
+    windows_pipe::connect(socket_path).await.map_err(|e| {
+        anyhow!(
+            "could not reach the daemon via {} ({e}). Is `ucb run` active?",
+            socket_path.display()
+        )
+    })
+}
+
 /// Ask the running daemon for a status snapshot.
 pub async fn request_status(socket_path: &Path) -> Result<StatusResponse> {
     let stream = connect(socket_path).await?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = tokio::io::split(stream);
     write_half.write_all(b"{\"cmd\":\"status\"}\n").await?;
     write_half.flush().await?;
     let mut reader = BufReader::new(read_half);
@@ -290,7 +345,7 @@ pub async fn request_send(
     mut on_update: impl FnMut(&SendUpdate),
 ) -> Result<SendUpdate> {
     let stream = connect(socket_path).await?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (read_half, mut write_half) = tokio::io::split(stream);
     let req = Request::Send {
         path: path.to_string(),
         to: to.map(|s| s.to_string()),
@@ -314,4 +369,89 @@ pub async fn request_send(
         last = Some(update);
     }
     last.ok_or_else(|| anyhow!("daemon closed the connection without a result"))
+}
+
+// ---------------------------------------------------------------------------
+// Windows transport: named pipes (no unix domain sockets on this platform).
+// ---------------------------------------------------------------------------
+
+#[cfg(windows)]
+mod windows_pipe {
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration;
+
+    use anyhow::{Context, Result};
+    use tokio::net::windows::named_pipe::{
+        ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+    };
+
+    /// Derive a stable named-pipe path from the daemon's socket-file path, so
+    /// sandboxed instances (distinct `--config-dir`, e.g. in tests) don't
+    /// collide on a shared pipe name.
+    fn pipe_name(socket_path: &Path) -> String {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        socket_path.hash(&mut hasher);
+        format!(r"\\.\pipe\ucb-{:016x}", hasher.finish())
+    }
+
+    /// Server-side listener. A named pipe has no persistent "listening"
+    /// handle the way a unix socket does: each instance serves exactly one
+    /// client, so we keep one pending instance around and create the next
+    /// one as soon as a client connects.
+    pub struct PipeListener {
+        name: String,
+        next: Option<NamedPipeServer>,
+    }
+
+    impl PipeListener {
+        pub fn bind(socket_path: &Path) -> Result<Self> {
+            let name = pipe_name(socket_path);
+            let first = ServerOptions::new()
+                .first_pipe_instance(true)
+                .create(&name)
+                .with_context(|| format!("binding IPC pipe at {name}"))?;
+            Ok(Self {
+                name,
+                next: Some(first),
+            })
+        }
+
+        pub async fn accept(&mut self) -> Result<NamedPipeServer> {
+            let server = self
+                .next
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("IPC pipe listener exhausted"))?;
+            server
+                .connect()
+                .await
+                .context("accepting IPC pipe connection")?;
+            // Line up the next instance before handing this one off, so a
+            // client connecting immediately after doesn't race a missing pipe.
+            self.next = Some(
+                ServerOptions::new()
+                    .create(&self.name)
+                    .context("creating next IPC pipe instance")?,
+            );
+            Ok(server)
+        }
+    }
+
+    /// Connect to the daemon's named pipe, retrying briefly on
+    /// `ERROR_PIPE_BUSY` (all server instances are momentarily in use).
+    pub async fn connect(socket_path: &Path) -> io::Result<NamedPipeClient> {
+        const ERROR_PIPE_BUSY: i32 = 231;
+        let name = pipe_name(socket_path);
+        for attempt in 0..20 {
+            match ClientOptions::new().open(&name) {
+                Ok(client) => return Ok(client),
+                Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < 19 => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        unreachable!()
+    }
 }
