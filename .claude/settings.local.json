@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(bash scripts/harness-test.sh)"
+      "Bash(bash scripts/harness-test.sh)",
+      "Bash(tasklist //FI \"IMAGENAME eq ucb.exe\")",
+      "Bash(./target/release/ucb.exe status *)"
     ]
   }
 }
