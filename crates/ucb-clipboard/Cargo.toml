@@ -10,5 +10,6 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 arboard = { workspace = true }
+clipboard-rs = { workspace = true }
 tokio = { workspace = true }
 blake3 = { workspace = true }

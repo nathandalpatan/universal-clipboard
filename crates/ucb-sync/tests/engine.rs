@@ -75,8 +75,9 @@ async fn start_node_with_static(
     start_node_full(name, identity, allowlist_path, static_peers, None, None).await
 }
 
-/// Full constructor exposing the Wave-2 knobs (history, file-size cap). The
-/// inbound-file directory is `<allowlist parent>/received`.
+/// Full constructor exposing the Wave-2 knobs (history, file-size cap). Auto
+/// file sync is off (the shipped default). The inbound-file directory is
+/// `<allowlist parent>/received`.
 async fn start_node_full(
     name: &str,
     identity: Identity,
@@ -84,6 +85,53 @@ async fn start_node_full(
     static_peers: Vec<String>,
     history: Option<std::sync::Arc<ucb_history::History>>,
     max_file_bytes: Option<u64>,
+) -> (Node, u16) {
+    start_node_inner(
+        name,
+        identity,
+        allowlist_path,
+        static_peers,
+        history,
+        max_file_bytes,
+        false,
+        ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES,
+    )
+    .await
+}
+
+/// Like [`start_node_full`] but with automatic file sync (FILE-1) enabled and a
+/// specific per-file cap.
+async fn start_node_auto(
+    name: &str,
+    identity: Identity,
+    allowlist_path: PathBuf,
+    max_auto_file_bytes: u64,
+) -> (Node, u16) {
+    start_node_inner(
+        name,
+        identity,
+        allowlist_path,
+        Vec::new(),
+        None,
+        None,
+        true,
+        max_auto_file_bytes,
+    )
+    .await
+}
+
+/// The fullest constructor, exposing every engine knob including FILE-1 auto
+/// file sync.
+#[allow(clippy::too_many_arguments)]
+async fn start_node_inner(
+    name: &str,
+    identity: Identity,
+    allowlist_path: PathBuf,
+    static_peers: Vec<String>,
+    history: Option<std::sync::Arc<ucb_history::History>>,
+    max_file_bytes: Option<u64>,
+    auto_file_sync: bool,
+    max_auto_file_bytes: u64,
 ) -> (Node, u16) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -107,6 +155,8 @@ async fn start_node_full(
             history,
             received_dir,
             max_file_bytes,
+            auto_file_sync,
+            max_auto_file_bytes,
         },
         listener,
         writer,
@@ -521,8 +571,8 @@ fn patterned(len: usize) -> Vec<u8> {
 }
 
 /// FILE-1/4/6: a ~600 KiB file sent A -> B arrives byte-identical in B's
-/// received dir, and B's clipboard holds the delivered file's path (the MVP
-/// clipboard-pointer behavior).
+/// received dir, and B's clipboard holds the delivered file as a real OS file
+/// reference (FILE-1 clipboard-pointer behavior; was path-as-text pre-FILE-1).
 #[tokio::test]
 async fn file_transfer_end_to_end() {
     let (dir_a, dir_b, id_a, id_b) = trusted_pair("file").await;
@@ -542,10 +592,12 @@ async fn file_transfer_end_to_end() {
     assert!(report.ok, "transfer should succeed: {report:?}");
     assert_eq!(report.bytes, bytes.len() as u64);
 
-    // B's clipboard should end up holding the received file's path.
-    let clip_path = wait_for(|| node_b.handle.get())
+    // B's clipboard should end up holding the received file as a file reference.
+    let clip_files = wait_for(|| node_b.handle.get_files())
         .await
-        .expect("B clipboard should hold the received-file path");
+        .expect("B clipboard should hold the received-file reference");
+    assert_eq!(clip_files.len(), 1, "expected exactly one file reference");
+    let clip_path = clip_files[0].to_string_lossy().into_owned();
     assert!(
         clip_path.ends_with("payload.bin"),
         "clipboard should hold the file path, got {clip_path}"
@@ -660,4 +712,152 @@ async fn history_recorded_on_both_sides() {
     assert_eq!(b_entry.content.as_deref(), Some("shared-clip"));
     assert_eq!(b_entry.origin_id, dev_a.to_string(), "B's record origin must be A");
     assert_eq!(b_entry.origin_name, "A", "B records the sender's display name");
+}
+
+// --- FILE-1: automatic file copy/paste sync ------------------------------
+
+/// Count regular files directly inside `dir` (0 if the dir does not exist).
+fn count_files(dir: &std::path::Path) -> usize {
+    if !dir.exists() {
+        return 0;
+    }
+    std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .count()
+}
+
+/// FILE-1: with `auto_file_sync` enabled, copying a file on A (a Files clipboard
+/// event) automatically transfers it to B. B ends up with byte-identical bytes
+/// in its received dir and a real file reference on its clipboard. B placing that
+/// reference on its own clipboard must NOT bounce the file back to A (echo).
+#[tokio::test]
+async fn auto_file_sync_end_to_end() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("autofile").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    let (node_a, port_a) =
+        start_node_auto("A", id_a, dir_a.join("trusted.json"), ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES)
+            .await;
+    let (node_b, port_b) =
+        start_node_auto("B", id_b, dir_b.join("trusted.json"), ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES)
+            .await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    // ~300 KiB (spans multiple 256 KiB chunks).
+    let bytes = patterned(300 * 1024 + 17);
+    let src = dir_a.join("clip.bin");
+    tokio::fs::write(&src, &bytes).await.unwrap();
+
+    // Simulate the user copying the file in the OS file manager.
+    node_a.handle.set_files(vec![src.clone()]);
+
+    // B receives it into its received dir, byte-identical.
+    let received = dir_b.join("received").join("clip.bin");
+    let got = wait_for(|| std::fs::read(&received).ok()).await;
+    assert_eq!(got.as_deref(), Some(bytes.as_slice()), "B did not receive identical bytes");
+
+    // B's clipboard holds the received file as a real OS file reference.
+    let clip_files = wait_for(|| node_b.handle.get_files())
+        .await
+        .expect("B clipboard should hold a file reference");
+    assert_eq!(clip_files.len(), 1, "expected exactly one file reference");
+    assert!(
+        clip_files[0].ends_with("clip.bin"),
+        "clipboard file reference should point at clip.bin, got {:?}",
+        clip_files[0]
+    );
+    assert!(
+        clip_files[0].to_string_lossy().contains("received"),
+        "delivered file should live in the received dir, got {:?}",
+        clip_files[0]
+    );
+
+    // Echo / quiescence: B writing the file to its own clipboard must not be
+    // re-observed and bounced back to A. A's received dir stays empty.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(count_files(&dir_a.join("received")), 0, "file bounced back to A (echo loop)");
+}
+
+/// FILE-1: with the shipped default (`auto_file_sync` off), copying a file on A
+/// starts no transfer — B receives nothing.
+#[tokio::test]
+async fn auto_file_sync_disabled_by_default() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("noauto").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    let (node_a, port_a) =
+        start_node_full("A", id_a, dir_a.join("trusted.json"), vec![], None, None).await;
+    let (node_b, port_b) =
+        start_node_full("B", id_b, dir_b.join("trusted.json"), vec![], None, None).await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    let bytes = patterned(50 * 1024);
+    let src = dir_a.join("nope.bin");
+    tokio::fs::write(&src, &bytes).await.unwrap();
+    node_a.handle.set_files(vec![src]);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count_files(&dir_b.join("received")), 0, "no transfer should occur when auto off");
+    assert_eq!(node_b.handle.get_files(), None, "B clipboard must be untouched");
+    assert_eq!(node_b.handle.get(), None);
+}
+
+/// FILE-1: a locally-copied file larger than `max_auto_file_bytes` is skipped by
+/// the sender; nothing is transferred.
+#[tokio::test]
+async fn auto_file_sync_skips_oversized() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("autobig").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    // A auto-syncs but caps auto files at 1 KiB.
+    let (node_a, port_a) = start_node_auto("A", id_a, dir_a.join("trusted.json"), 1024).await;
+    let (node_b, port_b) = start_node_auto(
+        "B",
+        id_b,
+        dir_b.join("trusted.json"),
+        ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES,
+    )
+    .await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    let bytes = patterned(50 * 1024); // 50 KiB > 1 KiB cap
+    let src = dir_a.join("big.bin");
+    tokio::fs::write(&src, &bytes).await.unwrap();
+    node_a.handle.set_files(vec![src]);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count_files(&dir_b.join("received")), 0, "oversized file must be skipped");
+    assert_eq!(node_b.handle.get_files(), None);
+}
+
+/// FILE-1: a locally-copied directory is skipped (only regular files are
+/// auto-sent); nothing is transferred.
+#[tokio::test]
+async fn auto_file_sync_skips_directory() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("autodir").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    let (node_a, port_a) = start_node_auto(
+        "A",
+        id_a,
+        dir_a.join("trusted.json"),
+        ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES,
+    )
+    .await;
+    let (node_b, port_b) = start_node_auto(
+        "B",
+        id_b,
+        dir_b.join("trusted.json"),
+        ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES,
+    )
+    .await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    // A folder (with a file inside, to be sure nothing recurses into it).
+    let folder = dir_a.join("a_folder");
+    tokio::fs::create_dir_all(&folder).await.unwrap();
+    tokio::fs::write(folder.join("inner.bin"), b"inner").await.unwrap();
+    node_a.handle.set_files(vec![folder]);
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(count_files(&dir_b.join("received")), 0, "directory must be skipped");
+    assert_eq!(node_b.handle.get_files(), None);
 }

@@ -79,3 +79,39 @@ jobs:
             target/release/ucb.exe
           if-no-files-found: warn
           retention-days: 14
+
+  # BG-1: compile-check the workspace on Windows, including the `#[cfg(windows)]`
+  # service module (windows-service SCM integration) which cannot be built on the
+  # Linux/macOS runners above. Windows needs no apt-style system deps: the
+  # keyring (Windows Credential Manager), arboard, and clipboard-rs backends are
+  # all built-in on Windows. We compile-check only (no `cargo test`) — the SCM
+  # calls require a real Windows service host to exercise at runtime.
+  windows-check:
+    name: build-check (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Compile-checks the whole workspace including the ucb-daemon bin (and thus
+      # the #[cfg(windows)] service module). Tests are not built here; the pure
+      # service-config logic is unit-tested on the Linux/macOS runners.
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Build release daemon
+        run: cargo build --release -p ucb-daemon
+
+      - name: Upload ucb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ucb-windows-latest
+          path: target/release/ucb.exe
+          if-no-files-found: warn
+          retention-days: 14

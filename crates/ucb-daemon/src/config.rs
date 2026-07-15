@@ -34,6 +34,19 @@ pub struct Config {
     /// `None` (the default) accepts any size.
     #[serde(default)]
     pub max_file_bytes: Option<u64>,
+    /// Automatically offer files copied to the local clipboard to peers, and
+    /// accept inbound file offers writing them into the received dir (FILE-1).
+    /// Off by default: file sync is opt-in.
+    #[serde(default)]
+    pub auto_file_sync: bool,
+    /// Skip auto file sync for files larger than this many bytes.
+    #[serde(default = "default_max_auto_file_bytes")]
+    pub max_auto_file_bytes: u64,
+}
+
+/// Default cap for auto-synced files (mirrors `ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES`).
+fn default_max_auto_file_bytes() -> u64 {
+    ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES
 }
 
 impl Config {
@@ -136,12 +149,16 @@ mod tests {
             keystore: Keystore::File,
             static_peers: vec!["10.0.0.7:48521".into(), "192.168.1.5:9000".into()],
             max_file_bytes: Some(1024),
+            auto_file_sync: true,
+            max_auto_file_bytes: 4096,
         };
         config.save(&paths).unwrap();
         let loaded = Config::load(&paths).unwrap();
         assert_eq!(loaded.static_peers, config.static_peers);
         assert_eq!(loaded.name, "Test");
         assert_eq!(loaded.max_file_bytes, Some(1024));
+        assert!(loaded.auto_file_sync);
+        assert_eq!(loaded.max_auto_file_bytes, 4096);
     }
 
     #[test]
@@ -156,5 +173,8 @@ mod tests {
         .unwrap();
         let loaded = Config::load(&paths).unwrap();
         assert!(loaded.static_peers.is_empty());
+        // Fields added later default cleanly for old configs.
+        assert!(!loaded.auto_file_sync);
+        assert_eq!(loaded.max_auto_file_bytes, default_max_auto_file_bytes());
     }
 }

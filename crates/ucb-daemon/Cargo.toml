@@ -25,3 +25,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 directories = { workspace = true }
 hex = { workspace = true }
+qrcode = { workspace = true }
+
+# BG-1: Windows background service (SCM) integration. Target-specific so it is
+# only pulled in when building for Windows; the root workspace manifest is
+# intentionally left untouched.
+[target.'cfg(windows)'.dependencies]
+windows-service = "0.7"

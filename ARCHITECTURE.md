@@ -98,6 +98,32 @@ Never sideways or upward.
 - **Status IPC (UX-1):** `ucb run` serves a JSON status snapshot on a unix
   socket in the runtime dir; `ucb status` reads it.
 
+## Wave 3 (build/expansion) — closing notes
+
+- **QR pairing (DISC-3/PAIR):** `ucb pair --listen` prints a `ucb://ip:port`
+  URI and a scannable terminal QR (suppressed off a TTY or with `--no-qr`);
+  `--connect` accepts either the bare `ip:port` or the URI. Lives in
+  `ucb-daemon/src/pairing.rs`.
+- **Auto file sync (FILE-1):** opt-in via `auto_file_sync` in `config.json`
+  (toggle with `ucb config set-auto-file-sync true|false`; `ucb config show`
+  dumps the config). When on, files copied to the clipboard are offered to
+  peers and inbound offers are accepted into the received dir, capped by
+  `max_auto_file_bytes` (default 100 MiB). Off by default.
+- **Windows service (BG-1):** `ucb service install|uninstall|status` on
+  Windows registers/manages the daemon with the SCM via the `windows-service`
+  crate (target-specific dep on `ucb-daemon`), replacing the previous
+  "unsupported" error. The launchd/systemd path is unchanged. Windows is
+  compile-checked by a `windows-latest` CI job (`cargo check` +
+  release build); the pure launch-arg/identifier logic is unit-tested
+  cross-platform.
+- **Named test cases (TEST-3):** `crates/ucb-sync/tests/named_cases.rs` makes
+  the four canonical scenarios explicit and canonical: `unpaired_device_rejection`,
+  `transfer_resume_after_interrupt`, `conflict_resolution_convergence`,
+  `clock_skew_rejection`.
+- **Netem harness (TEST-2):** `scripts/harness-test.sh --netem` re-runs the
+  two-device sync check under `latency` (200ms±50ms) and `loss` (10%) `tc`
+  presets in addition to the baseline.
+
 ## Conventions
 
 - Async: tokio. Errors: `thiserror` in libs, `anyhow` in the daemon.

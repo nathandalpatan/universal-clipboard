@@ -39,6 +39,7 @@
 //! and drops them together to shut it down. Hold both alive to keep watching.
 
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -49,6 +50,52 @@ use ucb_core::{ClipboardPayload, MAX_CLIP_BYTES};
 
 /// Result type for clipboard operations.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// A change observed on the OS clipboard by [`ClipboardService`] (FILE-1).
+///
+/// `ucb_core::ClipboardPayload` intentionally does not carry a file-reference
+/// variant (other crates own that type and its wire format), so file copies are
+/// surfaced here, one level up, as a distinct event alongside inline payloads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardEvent {
+    /// Inline clipboard content (text / HTML / image).
+    Payload(ClipboardPayload),
+    /// The clipboard holds one or more file references (e.g. a Finder copy).
+    /// Carries the local absolute paths; the transfer of their bytes is the
+    /// engine's concern, not this crate's.
+    Files(Vec<PathBuf>),
+}
+
+/// Deterministic change-detection hash for a file-reference list (FILE-1).
+///
+/// The list is sorted first so the hash is order-independent (selecting the same
+/// files in a different order is the same clipboard state), then each path's raw
+/// OS bytes are folded in with an unambiguous length prefix so distinct lists
+/// never collide. Used both for watcher change detection and for echo
+/// suppression of file lists we wrote ourselves. Never logs the paths (SEC-2).
+pub(crate) fn hash_paths(paths: &[PathBuf]) -> [u8; 32] {
+    let mut sorted: Vec<&PathBuf> = paths.iter().collect();
+    sorted.sort();
+    let mut h = blake3::Hasher::new();
+    h.update(b"files\0");
+    for p in sorted {
+        let bytes = p.as_os_str().as_encoded_bytes();
+        h.update(&(bytes.len() as u64).to_le_bytes());
+        h.update(bytes);
+    }
+    *h.finalize().as_bytes()
+}
+
+/// Plain-text fallback used when a backend cannot place a real OS file reference
+/// (unsupported platform or a failed native write): the newline-joined absolute
+/// paths, matching the pre-FILE-1 "path as text" behavior for a single file.
+fn paths_as_text(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// Errors produced by clipboard backends and the clipboard service.
 #[derive(Debug, thiserror::Error)]
@@ -78,6 +125,27 @@ pub trait SystemClipboard: Send + 'static {
     fn get(&mut self) -> Result<Option<ClipboardPayload>>;
     /// Replace the clipboard contents with `payload`.
     fn set(&mut self, payload: &ClipboardPayload) -> Result<()>;
+
+    /// Return the file references currently on the clipboard (FILE-1), or
+    /// `Ok(None)` when none are present. An empty list is reported as `None`.
+    ///
+    /// The default implementation reports no file references, so a backend with
+    /// no file support (e.g. a headless file-backed clipboard) needs no changes.
+    fn get_files(&mut self) -> Result<Option<Vec<PathBuf>>> {
+        Ok(None)
+    }
+
+    /// Place `paths` on the clipboard as real OS file references (FILE-1).
+    ///
+    /// Returns `Ok(true)` if a real file reference was written, or `Ok(false)`
+    /// if this backend cannot write file references (so the caller should fall
+    /// back to writing the paths as text). A failed *native* write is reported
+    /// as `Ok(false)` (never an error) so the fallback still runs.
+    ///
+    /// The default implementation writes nothing and returns `Ok(false)`.
+    fn set_files(&mut self, _paths: &[PathBuf]) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,6 +155,8 @@ pub trait SystemClipboard: Send + 'static {
 enum ArboardCmd {
     Get(std_mpsc::Sender<Result<Option<ClipboardPayload>>>),
     Set(ClipboardPayload, std_mpsc::Sender<Result<()>>),
+    GetFiles(std_mpsc::Sender<Result<Option<Vec<PathBuf>>>>),
+    SetFiles(Vec<PathBuf>, std_mpsc::Sender<Result<bool>>),
 }
 
 /// Real OS clipboard backed by the `arboard` crate.
@@ -147,6 +217,13 @@ impl ArboardClipboard {
                         return;
                     }
                 };
+                // FILE-1: a second, file-aware backend owned by the same thread.
+                // arboard has no file-list API, so file references go through
+                // clipboard-rs (NSPasteboard file URLs on macOS, and the native
+                // equivalents on Windows/Linux). If it cannot initialise, file
+                // reads report none and file writes fall back to text.
+                let files_ctx: Option<clipboard_rs::ClipboardContext> =
+                    clipboard_rs::ClipboardContext::new().ok();
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
                         ArboardCmd::Get(reply) => {
@@ -154,6 +231,12 @@ impl ArboardClipboard {
                         }
                         ArboardCmd::Set(payload, reply) => {
                             let _ = reply.send(arboard_set(&mut clipboard, &payload));
+                        }
+                        ArboardCmd::GetFiles(reply) => {
+                            let _ = reply.send(files_get(files_ctx.as_ref()));
+                        }
+                        ArboardCmd::SetFiles(paths, reply) => {
+                            let _ = reply.send(Ok(files_set(files_ctx.as_ref(), &paths)));
                         }
                     }
                 }
@@ -183,6 +266,66 @@ impl SystemClipboard for ArboardClipboard {
             .send(ArboardCmd::Set(payload.clone(), reply_tx))
             .map_err(|_| Error::WorkerStopped)?;
         reply_rx.recv().map_err(|_| Error::WorkerStopped)?
+    }
+
+    fn get_files(&mut self) -> Result<Option<Vec<PathBuf>>> {
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.tx
+            .send(ArboardCmd::GetFiles(reply_tx))
+            .map_err(|_| Error::WorkerStopped)?;
+        reply_rx.recv().map_err(|_| Error::WorkerStopped)?
+    }
+
+    fn set_files(&mut self, paths: &[PathBuf]) -> Result<bool> {
+        let (reply_tx, reply_rx) = std_mpsc::channel();
+        self.tx
+            .send(ArboardCmd::SetFiles(paths.to_vec(), reply_tx))
+            .map_err(|_| Error::WorkerStopped)?;
+        reply_rx.recv().map_err(|_| Error::WorkerStopped)?
+    }
+}
+
+/// Read file references from the OS clipboard via clipboard-rs. Runs on the
+/// dedicated backend thread. `None` means the context is unavailable or no file
+/// references are present. clipboard-rs yields plain absolute paths on macOS.
+fn files_get(ctx: Option<&clipboard_rs::ClipboardContext>) -> Result<Option<Vec<PathBuf>>> {
+    use clipboard_rs::Clipboard as _;
+    let Some(ctx) = ctx else {
+        return Ok(None);
+    };
+    match ctx.get_files() {
+        Ok(list) if !list.is_empty() => {
+            Ok(Some(list.into_iter().map(strip_file_uri).collect()))
+        }
+        // Empty list or "no files on the clipboard" are both simply "no files".
+        _ => Ok(None),
+    }
+}
+
+/// Write file references to the OS clipboard via clipboard-rs. Returns `true` on
+/// a real file-reference write, `false` if the context is missing or the native
+/// write failed (so the caller falls back to text). Never logs the paths (SEC-2).
+fn files_set(ctx: Option<&clipboard_rs::ClipboardContext>, paths: &[PathBuf]) -> bool {
+    use clipboard_rs::Clipboard as _;
+    let Some(ctx) = ctx else {
+        return false;
+    };
+    let strs: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    match ctx.set_files(strs) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(error = %e, count = paths.len(), "native file-reference write failed; falling back to text");
+            false
+        }
+    }
+}
+
+/// clipboard-rs returns plain paths on macOS but may return `file://` URIs on
+/// other backends; normalise to a plain path either way.
+fn strip_file_uri(s: String) -> PathBuf {
+    match s.strip_prefix("file://") {
+        Some(rest) => PathBuf::from(rest),
+        None => PathBuf::from(s),
     }
 }
 
@@ -251,7 +394,16 @@ fn arboard_set(clipboard: &mut arboard::Clipboard, payload: &ClipboardPayload) -
 /// [`get_payload`](Self::get_payload) drive the full multi-format surface.
 #[derive(Clone)]
 pub struct MockClipboardHandle {
-    state: Arc<Mutex<Option<ClipboardPayload>>>,
+    state: Arc<Mutex<MockState>>,
+}
+
+/// Shared mock clipboard contents. Holds at most one of an inline payload or a
+/// file-reference list at a time, mirroring a real clipboard where copying text
+/// clears any previously-copied files and vice versa.
+#[derive(Default)]
+struct MockState {
+    payload: Option<ClipboardPayload>,
+    files: Option<Vec<PathBuf>>,
 }
 
 impl MockClipboardHandle {
@@ -262,19 +414,30 @@ impl MockClipboardHandle {
 
     /// Simulate an external app copying an arbitrary payload to the clipboard.
     pub fn set_payload(&self, payload: ClipboardPayload) {
-        *self.state.lock().expect("mock clipboard poisoned") = Some(payload);
+        let mut s = self.state.lock().expect("mock clipboard poisoned");
+        s.payload = Some(payload);
+        s.files = None;
+    }
+
+    /// Simulate an external app copying file references (FILE-1).
+    pub fn set_files(&self, paths: Vec<PathBuf>) {
+        let mut s = self.state.lock().expect("mock clipboard poisoned");
+        s.files = Some(paths);
+        s.payload = None;
     }
 
     /// Simulate the clipboard being cleared / holding unsupported content.
     pub fn clear(&self) {
-        *self.state.lock().expect("mock clipboard poisoned") = None;
+        let mut s = self.state.lock().expect("mock clipboard poisoned");
+        s.payload = None;
+        s.files = None;
     }
 
     /// Read the current mock clipboard contents as text (e.g. to assert what
     /// the service wrote). Returns the text for `Text`, the plain-text
-    /// alternative for `Html`, and `None` for images / an empty clipboard.
+    /// alternative for `Html`, and `None` for images / files / empty.
     pub fn get(&self) -> Option<String> {
-        match &*self.state.lock().expect("mock clipboard poisoned") {
+        match &self.state.lock().expect("mock clipboard poisoned").payload {
             Some(ClipboardPayload::Text(s)) => Some(s.clone()),
             Some(ClipboardPayload::Html { alt_text, .. }) => Some(alt_text.clone()),
             _ => None,
@@ -283,7 +446,13 @@ impl MockClipboardHandle {
 
     /// Read the current mock clipboard contents as a full payload.
     pub fn get_payload(&self) -> Option<ClipboardPayload> {
-        self.state.lock().expect("mock clipboard poisoned").clone()
+        self.state.lock().expect("mock clipboard poisoned").payload.clone()
+    }
+
+    /// Read the file references currently on the mock clipboard (FILE-1). Used
+    /// by tests to assert what the service wrote via [`ClipboardWriter::write_files`].
+    pub fn get_files(&self) -> Option<Vec<PathBuf>> {
+        self.state.lock().expect("mock clipboard poisoned").files.clone()
     }
 }
 
@@ -291,13 +460,13 @@ impl MockClipboardHandle {
 /// [`MockClipboard::new`], which also hands back a [`MockClipboardHandle`] for
 /// injecting changes from the test thread.
 pub struct MockClipboard {
-    state: Arc<Mutex<Option<ClipboardPayload>>>,
+    state: Arc<Mutex<MockState>>,
 }
 
 impl MockClipboard {
     /// Create a mock clipboard (initially empty) and a handle to its state.
     pub fn new() -> (Self, MockClipboardHandle) {
-        let state = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(MockState::default()));
         (
             MockClipboard {
                 state: Arc::clone(&state),
@@ -309,12 +478,25 @@ impl MockClipboard {
 
 impl SystemClipboard for MockClipboard {
     fn get(&mut self) -> Result<Option<ClipboardPayload>> {
-        Ok(self.state.lock().expect("mock clipboard poisoned").clone())
+        Ok(self.state.lock().expect("mock clipboard poisoned").payload.clone())
     }
 
     fn set(&mut self, payload: &ClipboardPayload) -> Result<()> {
-        *self.state.lock().expect("mock clipboard poisoned") = Some(payload.clone());
+        let mut s = self.state.lock().expect("mock clipboard poisoned");
+        s.payload = Some(payload.clone());
+        s.files = None;
         Ok(())
+    }
+
+    fn get_files(&mut self) -> Result<Option<Vec<PathBuf>>> {
+        Ok(self.state.lock().expect("mock clipboard poisoned").files.clone())
+    }
+
+    fn set_files(&mut self, paths: &[PathBuf]) -> Result<bool> {
+        let mut s = self.state.lock().expect("mock clipboard poisoned");
+        s.files = Some(paths.to_vec());
+        s.payload = None;
+        Ok(true)
     }
 }
 
@@ -325,6 +507,12 @@ impl SystemClipboard for MockClipboard {
 enum WorkerCmd {
     Write {
         payload: ClipboardPayload,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// FILE-1: place file references on the clipboard, falling back to writing
+    /// the paths as text if the backend has no file-reference support.
+    WriteFiles {
+        paths: Vec<PathBuf>,
         reply: oneshot::Sender<Result<()>>,
     },
 }
@@ -349,6 +537,20 @@ impl ClipboardWriter {
             .map_err(|_| Error::WorkerStopped)?;
         reply_rx.await.map_err(|_| Error::WorkerStopped)?
     }
+
+    /// Place `paths` on the OS clipboard as real file references (FILE-1) and
+    /// mark them as our own write so the watcher suppresses the resulting change
+    /// event. If the backend cannot write file references, the paths are written
+    /// as newline-joined text instead (and that text write is echo-suppressed).
+    /// Resolves `Ok` when either the file-reference or the text fallback write
+    /// succeeds.
+    pub async fn write_files(&self, paths: Vec<PathBuf>) -> Result<()> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.tx
+            .send(WorkerCmd::WriteFiles { paths, reply })
+            .map_err(|_| Error::WorkerStopped)?;
+        reply_rx.await.map_err(|_| Error::WorkerStopped)?
+    }
 }
 
 /// Entry point for clipboard watching + writing.
@@ -370,12 +572,22 @@ impl ClipboardService {
     pub fn start<C: SystemClipboard>(
         mut clipboard: C,
         poll_interval: Duration,
-    ) -> (ClipboardWriter, mpsc::Receiver<ClipboardPayload>) {
+    ) -> (ClipboardWriter, mpsc::Receiver<ClipboardEvent>) {
         let (cmd_tx, cmd_rx) = std_mpsc::channel::<WorkerCmd>();
-        let (event_tx, event_rx) = mpsc::channel::<ClipboardPayload>(64);
+        let (event_tx, event_rx) = mpsc::channel::<ClipboardEvent>(64);
 
         // Establish the baseline synchronously so pre-existing content is not
         // emitted as a spurious change and does not race the first real change.
+        // Baselines for file references and inline payloads are tracked
+        // independently (they are mutually exclusive on a real clipboard).
+        let initial_files = match clipboard.get_files() {
+            Ok(Some(paths)) if !paths.is_empty() => Some(hash_paths(&paths)),
+            Ok(_) => None,
+            Err(e) => {
+                tracing::warn!(error = %e, "initial clipboard file read failed");
+                None
+            }
+        };
         let initial_seen = match clipboard.get() {
             Ok(Some(payload)) => Some(payload.content_hash()),
             Ok(None) => None,
@@ -387,7 +599,9 @@ impl ClipboardService {
 
         thread::Builder::new()
             .name("ucb-clipboard-watch".into())
-            .spawn(move || worker_loop(clipboard, poll_interval, cmd_rx, event_tx, initial_seen))
+            .spawn(move || {
+                worker_loop(clipboard, poll_interval, cmd_rx, event_tx, initial_seen, initial_files)
+            })
             .expect("failed to spawn clipboard watch thread");
 
         (ClipboardWriter { tx: cmd_tx }, event_rx)
@@ -410,13 +624,18 @@ fn worker_loop<C: SystemClipboard>(
     mut clipboard: C,
     poll_interval: Duration,
     cmd_rx: std_mpsc::Receiver<WorkerCmd>,
-    event_tx: mpsc::Sender<ClipboardPayload>,
+    event_tx: mpsc::Sender<ClipboardEvent>,
     initial_seen: Option<[u8; 32]>,
+    initial_files: Option<[u8; 32]>,
 ) {
     // Baseline is read synchronously in `ClipboardService::start` so that
     // pre-existing content is neither emitted nor able to race a real change.
+    // File references and inline payloads track their own last-seen/last-written
+    // tokens (they are mutually exclusive on a real clipboard).
     let mut last_seen: Option<[u8; 32]> = initial_seen;
     let mut last_written: Option<[u8; 32]> = None;
+    let mut last_seen_files: Option<[u8; 32]> = initial_files;
+    let mut last_written_files: Option<[u8; 32]> = None;
 
     loop {
         match cmd_rx.recv_timeout(poll_interval) {
@@ -431,34 +650,76 @@ fn worker_loop<C: SystemClipboard>(
                 }
                 let _ = reply.send(res);
             }
+            Ok(WorkerCmd::WriteFiles { paths, reply }) => {
+                // FILE-1: prefer a real OS file reference; fall back to text.
+                match clipboard.set_files(&paths) {
+                    Ok(true) => {
+                        // Suppress the echo of our own file-list write (SYNC-2).
+                        last_written_files = Some(hash_paths(&paths));
+                        let _ = reply.send(Ok(()));
+                    }
+                    // Unsupported or failed native write: write paths as text and
+                    // let the payload echo-suppression path handle the echo.
+                    Ok(false) | Err(_) => {
+                        let payload = ClipboardPayload::Text(paths_as_text(&paths));
+                        let res = clipboard.set(&payload);
+                        if res.is_ok() {
+                            last_written = Some(payload.content_hash());
+                        }
+                        let _ = reply.send(res);
+                    }
+                }
+            }
             Err(std_mpsc::RecvTimeoutError::Timeout) => {
-                match clipboard.get() {
-                    Ok(Some(payload)) => {
-                        let h = payload.content_hash();
-                        if Some(h) != last_seen {
-                            let was_echo = last_written == Some(h);
-                            // Any observed change consumes the echo token.
-                            last_written = None;
-                            last_seen = Some(h);
-                            if !was_echo {
-                                // Skip payloads too large to send inline; never
-                                // log content (SEC-2), only the size.
-                                if payload.byte_len() > MAX_CLIP_BYTES {
-                                    tracing::warn!(
-                                        bytes = payload.byte_len(),
-                                        max = MAX_CLIP_BYTES,
-                                        "clipboard payload exceeds MAX_CLIP_BYTES; skipping"
-                                    );
-                                } else if event_tx.blocking_send(payload).is_err() {
-                                    break; // event receiver dropped -> shut down
-                                }
+                // Read priority (FILE-1): file references first, then inline
+                // content (image > HTML > text, handled inside `clipboard.get`).
+                match clipboard.get_files() {
+                    Ok(Some(paths)) if !paths.is_empty() => {
+                        let h = hash_paths(&paths);
+                        if Some(h) != last_seen_files {
+                            let was_echo = last_written_files == Some(h);
+                            last_written_files = None;
+                            last_seen_files = Some(h);
+                            if !was_echo && event_tx.blocking_send(ClipboardEvent::Files(paths)).is_err()
+                            {
+                                break; // event receiver dropped -> shut down
                             }
                         }
                     }
-                    // Empty / unsupported clipboard content: nothing to report.
-                    Ok(None) => {}
-                    // Transient read error: log and keep polling.
-                    Err(e) => tracing::warn!(error = %e, "clipboard read failed"),
+                    // No file references: fall through to the inline-payload read.
+                    Ok(_) => match clipboard.get() {
+                        Ok(Some(payload)) => {
+                            let h = payload.content_hash();
+                            if Some(h) != last_seen {
+                                let was_echo = last_written == Some(h);
+                                // Any observed change consumes the echo token.
+                                last_written = None;
+                                last_seen = Some(h);
+                                if !was_echo {
+                                    // Skip payloads too large to send inline; never
+                                    // log content (SEC-2), only the size.
+                                    if payload.byte_len() > MAX_CLIP_BYTES {
+                                        tracing::warn!(
+                                            bytes = payload.byte_len(),
+                                            max = MAX_CLIP_BYTES,
+                                            "clipboard payload exceeds MAX_CLIP_BYTES; skipping"
+                                        );
+                                    } else if event_tx
+                                        .blocking_send(ClipboardEvent::Payload(payload))
+                                        .is_err()
+                                    {
+                                        break; // event receiver dropped -> shut down
+                                    }
+                                }
+                            }
+                        }
+                        // Empty / unsupported clipboard content: nothing to report.
+                        Ok(None) => {}
+                        // Transient read error: log and keep polling.
+                        Err(e) => tracing::warn!(error = %e, "clipboard read failed"),
+                    },
+                    // Transient file-read error: log and keep polling.
+                    Err(e) => tracing::warn!(error = %e, "clipboard file read failed"),
                 }
             }
             // All ClipboardWriter clones dropped -> shut down.
@@ -471,16 +732,32 @@ fn worker_loop<C: SystemClipboard>(
 mod tests {
     use super::*;
 
-    async fn recv(rx: &mut mpsc::Receiver<ClipboardPayload>) -> ClipboardPayload {
+    async fn recv_event(rx: &mut mpsc::Receiver<ClipboardEvent>) -> ClipboardEvent {
         tokio::time::timeout(Duration::from_secs(2), rx.recv())
             .await
             .expect("timed out waiting for a clipboard event")
             .expect("event channel closed unexpectedly")
     }
 
+    /// Receive and unwrap the next event as an inline payload.
+    async fn recv(rx: &mut mpsc::Receiver<ClipboardEvent>) -> ClipboardPayload {
+        match recv_event(rx).await {
+            ClipboardEvent::Payload(p) => p,
+            ClipboardEvent::Files(f) => panic!("expected a payload event, got Files({f:?})"),
+        }
+    }
+
+    /// Receive and unwrap the next event as a file-reference list.
+    async fn recv_files(rx: &mut mpsc::Receiver<ClipboardEvent>) -> Vec<PathBuf> {
+        match recv_event(rx).await {
+            ClipboardEvent::Files(f) => f,
+            ClipboardEvent::Payload(p) => panic!("expected a Files event, got Payload({p:?})"),
+        }
+    }
+
     /// Returns true if no event arrives within a window of several poll
     /// intervals (i.e. the watcher correctly stayed silent).
-    async fn no_event(rx: &mut mpsc::Receiver<ClipboardPayload>) -> bool {
+    async fn no_event(rx: &mut mpsc::Receiver<ClipboardEvent>) -> bool {
         tokio::time::timeout(Duration::from_millis(80), rx.recv())
             .await
             .is_err()
@@ -627,6 +904,96 @@ mod tests {
             text("x").content_hash(),
             html("x", "x").content_hash(),
             "Text and Html with the same string must not collide"
+        );
+    }
+
+    // ---- FILE-1: file-reference detection ---------------------------------
+
+    fn paths(ps: &[&str]) -> Vec<PathBuf> {
+        ps.iter().map(PathBuf::from).collect()
+    }
+
+    #[tokio::test]
+    async fn file_list_change_detection_and_dedup() {
+        let (mock, handle) = MockClipboard::new();
+        let (_writer, mut rx) = ClipboardService::start(mock, POLL);
+
+        let a = paths(&["/tmp/a.bin"]);
+        handle.set_files(a.clone());
+        assert_eq!(recv_files(&mut rx).await, a);
+
+        // Same list injected again -> no duplicate event (order-independent hash).
+        handle.set_files(paths(&["/tmp/a.bin"]));
+        assert!(no_event(&mut rx).await, "duplicate file list should not emit");
+
+        // A different list is reported.
+        let b = paths(&["/tmp/a.bin", "/tmp/b.bin"]);
+        handle.set_files(b.clone());
+        assert_eq!(recv_files(&mut rx).await, b);
+    }
+
+    #[tokio::test]
+    async fn file_list_has_priority_over_text_when_both_present() {
+        // A backend that always reports text, and reports a file list once the
+        // shared slot is populated. When both are present the watcher must
+        // prefer the file list (files > image > html > text).
+        struct BothClipboard {
+            files: Arc<Mutex<Option<Vec<PathBuf>>>>,
+        }
+        impl SystemClipboard for BothClipboard {
+            fn get(&mut self) -> Result<Option<ClipboardPayload>> {
+                Ok(Some(ClipboardPayload::Text("path-as-text".into())))
+            }
+            fn set(&mut self, _p: &ClipboardPayload) -> Result<()> {
+                Ok(())
+            }
+            fn get_files(&mut self) -> Result<Option<Vec<PathBuf>>> {
+                Ok(self.files.lock().unwrap().clone())
+            }
+        }
+        let slot = Arc::new(Mutex::new(None));
+        let (_writer, mut rx) = ClipboardService::start(
+            BothClipboard { files: slot.clone() },
+            POLL,
+        );
+        // Baseline captured text; now surface a file list alongside the text.
+        let f = paths(&["/tmp/x", "/tmp/y"]);
+        *slot.lock().unwrap() = Some(f.clone());
+        assert_eq!(recv_files(&mut rx).await, f, "files must win over coexisting text");
+    }
+
+    #[tokio::test]
+    async fn write_files_is_echo_suppressed_then_external_reported() {
+        let (mock, handle) = MockClipboard::new();
+        let (writer, mut rx) = ClipboardService::start(mock, POLL);
+
+        // Our own file-reference write must not echo back as a fresh event.
+        let f = paths(&["/tmp/recv/payload.bin"]);
+        writer.write_files(f.clone()).await.unwrap();
+        assert!(no_event(&mut rx).await, "own file write must not echo back");
+        // The write actually reached the (mock) clipboard as a file reference.
+        assert_eq!(handle.get_files(), Some(f));
+
+        // A genuine external file copy afterwards is still reported.
+        let g = paths(&["/tmp/other.bin"]);
+        handle.set_files(g.clone());
+        assert_eq!(recv_files(&mut rx).await, g);
+    }
+
+    #[test]
+    fn hash_paths_is_order_independent_and_collision_resistant() {
+        // Order independence: same set in a different order hashes identically.
+        assert_eq!(
+            hash_paths(&paths(&["/a", "/b"])),
+            hash_paths(&paths(&["/b", "/a"])),
+        );
+        // Distinct lists differ.
+        assert_ne!(hash_paths(&paths(&["/a"])), hash_paths(&paths(&["/b"])));
+        assert_ne!(hash_paths(&paths(&["/a"])), hash_paths(&paths(&["/a", "/b"])));
+        // The length prefix prevents boundary collisions ("/ab"+"/c" vs "/a"+"/bc").
+        assert_ne!(
+            hash_paths(&paths(&["/ab", "/c"])),
+            hash_paths(&paths(&["/a", "/bc"])),
         );
     }
 }

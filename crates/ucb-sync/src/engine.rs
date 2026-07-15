@@ -38,7 +38,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use ucb_clipboard::ClipboardWriter;
+use ucb_clipboard::{ClipboardEvent, ClipboardWriter};
 use ucb_core::{
     ClipboardItem, ClipboardPayload, DeviceId, DeviceInfo, Platform, WireMessage, PROTOCOL_VERSION,
 };
@@ -144,7 +144,19 @@ pub struct EngineConfig {
     /// Reject inbound file offers larger than this many bytes (FILE-6 policy).
     /// `None` accepts any size.
     pub max_file_bytes: Option<u64>,
+    /// FILE-1: when `true`, copying files locally automatically sends them to
+    /// every connected peer. Default `false` — copying files on a desktop is a
+    /// common local action and must not silently start network transfers; this
+    /// is opt-in.
+    pub auto_file_sync: bool,
+    /// FILE-1: per-file size cap for automatic file sync. Files larger than this
+    /// are skipped (with an info log) rather than auto-sent. Ignored unless
+    /// `auto_file_sync` is `true`.
+    pub max_auto_file_bytes: u64,
 }
+
+/// Default per-file cap for automatic file sync (FILE-1): 100 MiB.
+pub const DEFAULT_MAX_AUTO_FILE_BYTES: u64 = 100 * 1024 * 1024;
 
 /// A live session's outbound handle.
 struct SessionEntry {
@@ -188,6 +200,10 @@ struct Shared {
     received_dir: PathBuf,
     /// FILE-6: inbound file offers larger than this are rejected.
     max_file_bytes: Option<u64>,
+    /// FILE-1: auto-send locally-copied files to connected peers (opt-in).
+    auto_file_sync: bool,
+    /// FILE-1: per-file cap for auto file sync.
+    max_auto_file_bytes: u64,
     /// FILE-4: routes inbound `FileAccept/FileReject/FileDone` for an outbound
     /// transfer (keyed by `transfer_id`) to its running send-pump task.
     send_routes: Mutex<HashMap<u64, mpsc::Sender<WireMessage>>>,
@@ -210,7 +226,7 @@ impl SyncEngine {
         config: EngineConfig,
         listener: TcpListener,
         writer: ClipboardWriter,
-        clip_rx: mpsc::Receiver<ClipboardPayload>,
+        clip_rx: mpsc::Receiver<ClipboardEvent>,
         disc_rx: mpsc::Receiver<PeerEvent>,
     ) -> Result<Self> {
         let identity = Arc::new(config.identity);
@@ -238,6 +254,8 @@ impl SyncEngine {
             history: config.history,
             received_dir: config.received_dir,
             max_file_bytes: config.max_file_bytes,
+            auto_file_sync: config.auto_file_sync,
+            max_auto_file_bytes: config.max_auto_file_bytes,
             send_routes: Mutex::new(HashMap::new()),
         });
 
@@ -941,12 +959,15 @@ impl Shared {
     }
 
     /// Finalize a received file (FILE-6): ack the sender, log the saved path, and
-    /// write that path as a Text clip to the local clipboard.
+    /// place the received file on the local clipboard.
     ///
-    /// MVP clipboard-pointer choice: the received file's absolute path is placed
-    /// on the local clipboard as plain text (not the file bytes). The write goes
-    /// through [`ClipboardWriter`], whose echo suppression keeps it from being
-    /// re-broadcast to peers, so the pointer stays local to this device.
+    /// Clipboard-pointer behavior (FILE-1): the received file is placed on the
+    /// local clipboard as a real OS file reference via
+    /// [`ClipboardWriter::write_files`], so pasting yields the actual file (e.g.
+    /// in Finder). On platforms/backends without file-reference support the
+    /// writer transparently falls back to writing the absolute path as text. The
+    /// write goes through [`ClipboardWriter`], whose echo suppression keeps it
+    /// from being re-broadcast to peers, so it stays local to this device.
     async fn deliver_received<S>(
         &self,
         chan: &mut SecureChannel<S>,
@@ -964,9 +985,8 @@ impl Shared {
             .await;
         tracing::info!(transfer_id, path = %path.display(), "file received");
         let abs = tokio::fs::canonicalize(&path).await.unwrap_or(path);
-        let pointer = abs.to_string_lossy().into_owned();
-        if let Err(e) = self.writer.write(ClipboardPayload::Text(pointer)).await {
-            tracing::warn!(error = %e, "failed to write received-file pointer to clipboard");
+        if let Err(e) = self.writer.write_files(vec![abs]).await {
+            tracing::warn!(error = %e, "failed to write received-file reference to clipboard");
         }
     }
 
@@ -981,49 +1001,136 @@ impl Shared {
 
     // --- local clipboard broadcast (SYNC-1) --------------------------------
 
-    async fn local_clip_loop(self: Arc<Self>, mut clip_rx: mpsc::Receiver<ClipboardPayload>) {
-        while let Some(payload) = clip_rx.recv().await {
-            let item = ClipboardItem {
-                payload,
-                ts_ms: now_ms(),
-                origin: self.self_id,
-            };
-            // A local copy is the freshest user intent: record it as latest.
-            *self.latest.lock().unwrap() = Some(item.clone());
-            // HIST-1/3: record the local clip under this device's own name.
-            self.record_history(&item, &self.name);
-
-            // Snapshot live sessions, then send outside the lock.
-            let live: HashMap<DeviceId, mpsc::Sender<Outbound>> = self
-                .sessions
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(id, e)| (*id, e.tx.clone()))
-                .collect();
-            for tx in live.values() {
-                // Drop rather than block if a peer's queue is backed up.
-                let _ = tx.try_send(Outbound::Clip(item.clone()));
-            }
-
-            // SYNC-5: buffer this clip for every trusted peer that is currently
-            // offline (no live session, not tombstoned).
-            let offline: Vec<DeviceId> = {
-                let allowlist = self.allowlist.lock().unwrap();
-                allowlist
-                    .list()
-                    .into_iter()
-                    .map(|d| d.device_id)
-                    .filter(|id| !live.contains_key(id) && !allowlist.is_tombstoned(id))
-                    .collect()
-            };
-            if !offline.is_empty() {
-                let mut queue = self.queue.lock().unwrap();
-                for id in offline {
-                    if let Err(e) = queue.enqueue(&id, item.clone(), item.ts_ms) {
-                        tracing::warn!(error = %e, "failed to enqueue offline clip");
+    async fn local_clip_loop(self: Arc<Self>, mut clip_rx: mpsc::Receiver<ClipboardEvent>) {
+        while let Some(event) = clip_rx.recv().await {
+            match event {
+                ClipboardEvent::Payload(payload) => self.broadcast_local_payload(payload),
+                // FILE-1: a local file copy. Auto-send it to peers when enabled;
+                // otherwise ignore (copying files locally is a common action and
+                // must not silently start transfers).
+                ClipboardEvent::Files(paths) => {
+                    if self.auto_file_sync {
+                        tokio::spawn(self.clone().auto_send_files(paths));
+                    } else {
+                        tracing::debug!(
+                            count = paths.len(),
+                            "local file copy ignored (auto_file_sync disabled)"
+                        );
                     }
                 }
+            }
+        }
+    }
+
+    /// SYNC-1: broadcast a locally-copied inline payload to live peers, record it
+    /// as `latest`/history, and buffer it for offline trusted peers (SYNC-5).
+    fn broadcast_local_payload(self: &Arc<Self>, payload: ClipboardPayload) {
+        let item = ClipboardItem {
+            payload,
+            ts_ms: now_ms(),
+            origin: self.self_id,
+        };
+        // A local copy is the freshest user intent: record it as latest.
+        *self.latest.lock().unwrap() = Some(item.clone());
+        // HIST-1/3: record the local clip under this device's own name.
+        self.record_history(&item, &self.name);
+
+        // Snapshot live sessions, then send outside the lock.
+        let live: HashMap<DeviceId, mpsc::Sender<Outbound>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, e)| (*id, e.tx.clone()))
+            .collect();
+        for tx in live.values() {
+            // Drop rather than block if a peer's queue is backed up.
+            let _ = tx.try_send(Outbound::Clip(item.clone()));
+        }
+
+        // SYNC-5: buffer this clip for every trusted peer that is currently
+        // offline (no live session, not tombstoned).
+        let offline: Vec<DeviceId> = {
+            let allowlist = self.allowlist.lock().unwrap();
+            allowlist
+                .list()
+                .into_iter()
+                .map(|d| d.device_id)
+                .filter(|id| !live.contains_key(id) && !allowlist.is_tombstoned(id))
+                .collect()
+        };
+        if !offline.is_empty() {
+            let mut queue = self.queue.lock().unwrap();
+            for id in offline {
+                if let Err(e) = queue.enqueue(&id, item.clone(), item.ts_ms) {
+                    tracing::warn!(error = %e, "failed to enqueue offline clip");
+                }
+            }
+        }
+    }
+
+    /// FILE-1: automatically send each eligible locally-copied file to every
+    /// connected peer. Directories, unreadable entries, and files over the
+    /// per-file cap are skipped with an info log (naming the reason and file, but
+    /// never the contents — SEC-2). Reuses the existing `send_file` machinery.
+    async fn auto_send_files(self: Arc<Self>, paths: Vec<PathBuf>) {
+        // Snapshot the currently connected peers once for the whole batch.
+        let targets: Vec<DeviceId> = self.sessions.lock().unwrap().keys().copied().collect();
+        if targets.is_empty() {
+            tracing::debug!(count = paths.len(), "auto file sync: no connected peers");
+            return;
+        }
+
+        for path in paths {
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::info!(file = %path.display(), error = %e, "auto file sync: skipping unreadable path");
+                    continue;
+                }
+            };
+            if meta.is_dir() {
+                tracing::info!(file = %path.display(), "auto file sync: skipping directory");
+                continue;
+            }
+            if !meta.is_file() {
+                tracing::info!(file = %path.display(), "auto file sync: skipping non-regular file");
+                continue;
+            }
+            if meta.len() > self.max_auto_file_bytes {
+                tracing::info!(
+                    file = %path.display(),
+                    bytes = meta.len(),
+                    cap = self.max_auto_file_bytes,
+                    "auto file sync: skipping file over size cap"
+                );
+                continue;
+            }
+
+            for target in &targets {
+                let me = self.clone();
+                let path = path.clone();
+                let target = *target;
+                tokio::spawn(async move {
+                    match me.send_file(path, Some(target), None).await {
+                        Ok(report) if report.ok => tracing::info!(
+                            name = %report.name,
+                            peer = %target.short(),
+                            "auto file sync: sent"
+                        ),
+                        Ok(report) => tracing::warn!(
+                            name = %report.name,
+                            peer = %target.short(),
+                            detail = %report.detail,
+                            "auto file sync: transfer not completed"
+                        ),
+                        Err(e) => tracing::warn!(
+                            peer = %target.short(),
+                            error = %e,
+                            "auto file sync: send failed"
+                        ),
+                    }
+                });
             }
         }
     }
