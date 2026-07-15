@@ -20,9 +20,10 @@
 mod config;
 mod headless;
 mod ipc;
+mod pairing;
 mod service;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -69,13 +70,27 @@ enum Command {
         print_id: bool,
     },
     /// Pair with another device (run `--listen` on one, `--connect` on the other).
+    ///
+    /// On `--listen`, alongside the usual instructions the daemon prints a
+    /// `ucb://ip:port` pairing URI (and, on a terminal, a scannable QR code) so
+    /// the other device can connect even when mDNS discovery is blocked
+    /// (DISC-3). `--connect` accepts either a bare `ip:port` or such a URI.
     Pair {
         /// Wait for an incoming pairing connection on the configured port.
         #[arg(long, conflicts_with = "connect")]
         listen: bool,
-        /// Dial a listening device at `ip:port`.
-        #[arg(long, value_name = "IP:PORT")]
+        /// Dial a listening device at `ip:port` or `ucb://ip:port`.
+        #[arg(long, value_name = "ADDR")]
         connect: Option<String>,
+        /// Advertise this IP in the `--listen` pairing URI/QR instead of the
+        /// auto-detected primary address (use on multi-homed hosts, or when the
+        /// default route is not the LAN the peer is on).
+        #[arg(long, value_name = "IP", requires = "listen")]
+        host: Option<String>,
+        /// Do not render the QR code under the pairing URI on `--listen`. (The
+        /// QR is also suppressed automatically when stdout is not a terminal.)
+        #[arg(long, requires = "listen")]
+        no_qr: bool,
         /// Auto-confirm the pairing code without prompting (prints the code).
         /// (Test/automation flag; skips the interactive verification.)
         #[arg(long)]
@@ -96,6 +111,11 @@ enum Command {
     Peer {
         #[command(subcommand)]
         action: PeerAction,
+    },
+    /// View or change persisted daemon settings in `config.json`.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
     },
     /// Run the sync daemon until Ctrl-C.
     Run {
@@ -134,6 +154,22 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Enable or disable automatic file sync (FILE-1).
+    ///
+    /// When on, files copied to the clipboard are offered to peers and inbound
+    /// file offers are accepted into the received dir (up to the size cap).
+    /// Takes effect the next time `ucb run` starts.
+    SetAutoFileSync {
+        /// `true` to enable, `false` to disable.
+        #[arg(action = clap::ArgAction::Set, value_parser = clap::builder::BoolishValueParser::new())]
+        enabled: bool,
+    },
+    /// Print the current configuration as JSON.
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -227,11 +263,14 @@ async fn main() -> Result<()> {
         Command::Pair {
             listen,
             connect,
+            host,
+            no_qr,
             yes,
-        } => cmd_pair(&paths, listen, connect, yes).await,
+        } => cmd_pair(&paths, listen, connect, host, no_qr, yes).await,
         Command::Devices => cmd_devices(&paths),
         Command::Revoke { prefix, forget } => cmd_revoke(&paths, prefix, forget),
         Command::Peer { action } => cmd_peer(&paths, action),
+        Command::Config { action } => cmd_config(&paths, action),
         Command::Run {
             poll_ms,
             headless_dir,
@@ -263,6 +302,8 @@ fn cmd_init(
         keystore,
         static_peers: Vec::new(),
         max_file_bytes: None,
+        auto_file_sync: false,
+        max_auto_file_bytes: ucb_sync::DEFAULT_MAX_AUTO_FILE_BYTES,
     };
 
     // Generating the identity persists it via the selected key store.
@@ -296,6 +337,8 @@ async fn cmd_pair(
     paths: &Paths,
     listen: bool,
     connect: Option<String>,
+    host: Option<String>,
+    no_qr: bool,
     yes: bool,
 ) -> Result<()> {
     let config = Config::load(paths)?;
@@ -323,6 +366,7 @@ async fn cmd_pair(
             config.listen_port,
             identity.device_id().short()
         );
+        print_pairing_uris(host.as_deref(), config.listen_port, no_qr);
         pair_listen(
             listener,
             &identity,
@@ -333,9 +377,11 @@ async fn cmd_pair(
         )
         .await?
     } else if let Some(addr) = connect {
-        println!("Connecting to {addr} to pair...");
+        // Accept either a bare `ip:port` or a `ucb://ip:port` URI (DISC-3).
+        let target = pairing::parse_pairing_target(&addr)?;
+        println!("Connecting to {target} to pair...");
         pair_dial(
-            &addr,
+            &target,
             &identity,
             &paths.trusted_file,
             &config.name,
@@ -344,7 +390,9 @@ async fn cmd_pair(
         )
         .await?
     } else {
-        return Err(anyhow!("specify either --listen or --connect <ip:port>"));
+        return Err(anyhow!(
+            "specify either --listen or --connect <ip:port|ucb://ip:port>"
+        ));
     };
 
     println!(
@@ -353,6 +401,57 @@ async fn cmd_pair(
         trusted.device_id.short()
     );
     Ok(())
+}
+
+/// Print the `ucb://ip:port` pairing URI(s) for `--listen`, plus a scannable
+/// terminal QR under each (DISC-3 fallback / PAIR-2).
+///
+/// Host selection: `--host <ip>` wins; otherwise the auto-detected primary
+/// local IPv4 is used. Without either (e.g. offline) we cannot know the
+/// address, so we print a hint to pass `--host` rather than a wrong URI.
+///
+/// The QR is suppressed when `no_qr` is set OR when stdout is not a terminal
+/// (so `--yes` runs in the Docker harness, which is non-TTY, never emit it and
+/// the automation output contract is preserved).
+fn print_pairing_uris(host: Option<&str>, port: u16, no_qr: bool) {
+    let show_qr = !no_qr && std::io::stdout().is_terminal();
+
+    let hosts: Vec<String> = match host {
+        Some(h) => vec![h.to_string()],
+        None => match pairing::primary_local_ipv4() {
+            Some(ip) => vec![ip.to_string()],
+            None => Vec::new(),
+        },
+    };
+
+    if hosts.is_empty() {
+        println!();
+        println!(
+            "Could not auto-detect this device's LAN address; re-run with \
+             `--host <ip>` to print a `ucb://ip:{port}` pairing URI/QR."
+        );
+        return;
+    }
+
+    println!();
+    println!("Or connect from the other device using this pairing address:");
+    for h in &hosts {
+        let uri = pairing::format_pairing_uri(h, port);
+        println!("  {uri}");
+        if show_qr {
+            match pairing::render_qr(&uri) {
+                Ok(qr) => {
+                    println!();
+                    print!("{qr}");
+                }
+                Err(e) => tracing::warn!(error = %e, "could not render pairing QR"),
+            }
+        }
+    }
+    println!(
+        "  (run `ucb pair --connect <that-address>` on the other device; the \
+         6-digit code below still confirms trust.)"
+    );
 }
 
 fn cmd_devices(paths: &Paths) -> Result<()> {
@@ -394,6 +493,25 @@ fn cmd_revoke(paths: &Paths, prefix: String, forget: bool) -> Result<()> {
             None => Err(anyhow!(
                 "no unique device matches prefix {prefix:?} (see `ucb devices`)"
             )),
+        }
+    }
+}
+
+fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<()> {
+    match action {
+        ConfigAction::SetAutoFileSync { enabled } => {
+            let mut config = Config::load(paths)?;
+            config.auto_file_sync = enabled;
+            config.save(paths)?;
+            println!(
+                "auto_file_sync = {enabled} (takes effect on next `ucb run`)."
+            );
+            Ok(())
+        }
+        ConfigAction::Show => {
+            let config = Config::load(paths)?;
+            println!("{}", serde_json::to_string_pretty(&config)?);
+            Ok(())
         }
     }
 }
@@ -513,6 +631,8 @@ async fn cmd_run(paths: &Paths, poll_ms: u64, headless_dir: Option<PathBuf>) -> 
             history: history.clone(),
             received_dir: paths.received_dir.clone(),
             max_file_bytes: config.max_file_bytes,
+            auto_file_sync: config.auto_file_sync,
+            max_auto_file_bytes: config.max_auto_file_bytes,
         },
         listener,
         writer,
@@ -778,12 +898,24 @@ fn cmd_service(
     action: ServiceAction,
 ) -> Result<()> {
     let _ = paths; // reserved for future per-service state
-    let home = service::home_dir()?;
-    let program = std::env::current_exe()
-        .context("resolving the current executable path")?
-        .to_string_lossy()
-        .into_owned();
+    let exe = std::env::current_exe().context("resolving the current executable path")?;
     let args = service::run_args(config_dir_override.as_deref());
+
+    // Windows (BG-1): register/manage via the SCM instead of a launchd/systemd
+    // definition file.
+    #[cfg(windows)]
+    {
+        return match action {
+            ServiceAction::Install { activate } => service::windows::install(&exe, &args, activate),
+            ServiceAction::Uninstall { activate } => service::windows::uninstall(activate),
+            ServiceAction::Status => service::windows::status(),
+        };
+    }
+
+    #[cfg(not(windows))]
+    {
+    let home = service::home_dir()?;
+    let program = exe.to_string_lossy().into_owned();
 
     match action {
         ServiceAction::Install { activate } => {
@@ -833,9 +965,11 @@ fn cmd_service(
             Ok(())
         }
     }
+    }
 }
 
 /// Run a shell command line (used only behind `--activate`).
+#[cfg(not(windows))]
 fn run_shell(cmd: &str) -> Result<()> {
     let status = std::process::Command::new("sh")
         .arg("-c")

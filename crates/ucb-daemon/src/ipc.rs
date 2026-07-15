@@ -91,7 +91,7 @@ pub enum SendUpdate {
 
 /// Bind the IPC socket, replacing any stale file, and set it to mode 0600.
 #[cfg(unix)]
-pub fn bind(socket_path: &Path) -> Result<UnixListener> {
+pub fn bind(socket_path: &Path) -> Result<Listener> {
     // A leftover socket from a previous run would make bind() fail with
     // EADDRINUSE; remove it first (it is safe — we hold the config dir).
     let _ = std::fs::remove_file(socket_path);
@@ -112,7 +112,7 @@ pub fn bind(socket_path: &Path) -> Result<Listener> {
 /// Accept and serve IPC connections until the listener is dropped. Each
 /// connection is handled on its own task.
 #[cfg(unix)]
-pub async fn serve(listener: UnixListener, engine: Arc<SyncEngine>) {
+pub async fn serve(listener: Listener, engine: Arc<SyncEngine>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
