@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Universal Clipboard</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="daemon-dot" title="daemon status"></span>
+        <strong>Universal Clipboard</strong>
+      </div>
+      <nav class="tabs">
+        <button class="tab is-active" data-view="devices">Devices</button>
+        <button class="tab" data-view="pair">Pair</button>
+        <button class="tab" data-view="history">History</button>
+      </nav>
+    </header>
+
+    <main>
+      <!-- Devices -->
+      <section id="view-devices" class="view is-active">
+        <div class="view-head">
+          <h1>Devices</h1>
+          <span class="spinner" id="devices-spin"></span>
+        </div>
+        <div id="devices-body"></div>
+      </section>
+
+      <!-- Pair -->
+      <section id="view-pair" class="view">
+        <div class="view-head"><h1>Pair a device</h1></div>
+        <div id="pair-idle">
+          <p class="muted">
+            Start a pairing session, then run
+            <code>ucb pair --connect &lt;address&gt;</code> on the other device
+            (or scan the QR). Confirm the 6-digit code matches on both screens.
+          </p>
+          <button class="btn primary" id="pair-start">Start pairing</button>
+        </div>
+
+        <div id="pair-live" hidden>
+          <div class="card">
+            <h2>Waiting for a device…</h2>
+            <label class="fieldlabel">Pairing address</label>
+            <div class="uri-row">
+              <code id="pair-uri"></code>
+              <button class="btn small" id="pair-copy">Copy</button>
+            </div>
+            <pre id="pair-qr" class="qr"></pre>
+          </div>
+
+          <div class="card" id="pair-code-card" hidden>
+            <h2>Confirm the code</h2>
+            <p class="muted">Make sure this matches the code on
+              <strong id="pair-peer">the other device</strong>:</p>
+            <div class="code" id="pair-code"></div>
+            <div class="row">
+              <button class="btn primary" id="pair-accept">Codes match — pair</button>
+              <button class="btn danger" id="pair-reject">Reject</button>
+            </div>
+          </div>
+
+          <button class="btn small ghost" id="pair-cancel">Cancel</button>
+        </div>
+
+        <div id="pair-result" class="banner" hidden></div>
+      </section>
+
+      <!-- History -->
+      <section id="view-history" class="view">
+        <div class="view-head">
+          <h1>History</h1>
+          <span class="spinner" id="history-spin"></span>
+        </div>
+        <div class="filters">
+          <input type="search" id="hist-search" placeholder="Search text…" />
+          <select id="hist-device"><option value="">All devices</option></select>
+          <label class="check"><input type="checkbox" id="hist-starred" /> Starred only</label>
+          <button class="btn small" id="hist-apply">Apply</button>
+        </div>
+        <div id="history-body"></div>
+        <div class="center">
+          <button class="btn small ghost" id="hist-more" hidden>Load more</button>
+        </div>
+      </section>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

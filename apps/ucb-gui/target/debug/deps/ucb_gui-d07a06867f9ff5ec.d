@@ -1,0 +1,20 @@
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/deps/ucb_gui-d07a06867f9ff5ec.d: src/main.rs /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/b569621ce835412406b100578ce2767e0cca120564fec436ea41448008f28ec7 /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/app.js /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/00d8cd2689f9fb01d0a057528c4ebee343f2b1c7e231f76d48f8bd60a5a77e92.js /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/index.html /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/45e93e6d1e47062e9cfbea0b83502182af4deba768fac3a699c01130cd8b5915.html /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/style.css /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/a69367272d9134af9df0394604ef321cc72419d564b23dc064bc6b1d18081529.css Cargo.toml
+
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/deps/libucb_gui-d07a06867f9ff5ec.rmeta: src/main.rs /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/b569621ce835412406b100578ce2767e0cca120564fec436ea41448008f28ec7 /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/app.js /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/00d8cd2689f9fb01d0a057528c4ebee343f2b1c7e231f76d48f8bd60a5a77e92.js /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/index.html /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/45e93e6d1e47062e9cfbea0b83502182af4deba768fac3a699c01130cd8b5915.html /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/style.css /Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/a69367272d9134af9df0394604ef321cc72419d564b23dc064bc6b1d18081529.css Cargo.toml
+
+src/main.rs:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/b569621ce835412406b100578ce2767e0cca120564fec436ea41448008f28ec7:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/app.js:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/00d8cd2689f9fb01d0a057528c4ebee343f2b1c7e231f76d48f8bd60a5a77e92.js:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/index.html:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/45e93e6d1e47062e9cfbea0b83502182af4deba768fac3a699c01130cd8b5915.html:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/./dist/style.css:
+/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out/tauri-codegen-assets/a69367272d9134af9df0394604ef321cc72419d564b23dc064bc6b1d18081529.css:
+Cargo.toml:
+
+# env-dep:CARGO_PKG_AUTHORS=
+# env-dep:CARGO_PKG_DESCRIPTION=Universal Clipboard desktop GUI shell (Tauri v2 tray app)
+# env-dep:CARGO_PKG_NAME=ucb-gui
+# env-dep:CLIPPY_ARGS=-D__CLIPPY_HACKERY__warnings__CLIPPY_HACKERY__
+# env-dep:CLIPPY_CONF_DIR
+# env-dep:OUT_DIR=/Users/nathandalpatan/Documents/tech/universal-clipboard/apps/ucb-gui/target/debug/build/ucb-gui-890a7ee706f640e2/out

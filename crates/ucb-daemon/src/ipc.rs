@@ -13,6 +13,7 @@
 //!   [`SendUpdate::Result`] or [`SendUpdate::Error`] line.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -21,8 +22,13 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 #[cfg(unix)]
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::mpsc;
-use ucb_core::{DeviceId, PROTOCOL_VERSION};
-use ucb_sync::{SendProgress, SyncEngine};
+use ucb_core::{DeviceId, DeviceInfo, Platform, PROTOCOL_VERSION};
+use ucb_crypto::Identity;
+use ucb_history::{History, HistoryQuery};
+use ucb_sync::{pair_listen, SendProgress, SyncEngine};
+
+use crate::config::{Config, Paths};
+use crate::pairing;
 
 #[cfg(unix)]
 type IpcStream = UnixStream;
@@ -34,9 +40,14 @@ pub type Listener = UnixListener;
 #[cfg(windows)]
 pub type Listener = windows_pipe::PipeListener;
 
-/// A command sent by a CLI client to the running daemon.
+/// A command sent by a client (the CLI or the desktop GUI) to the running
+/// daemon.
+///
+/// Serialized as newline-delimited JSON tagged by `cmd` in `snake_case`, e.g.
+/// `{"cmd":"history_list","limit":50}`. The original `status`/`send` commands
+/// keep their single-word tags; the GUI (HIST-3 / UX-2 / PAIR-2) adds the rest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "cmd", rename_all = "lowercase")]
+#[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Request {
     /// Ask for a snapshot of peer connection state.
     Status,
@@ -48,6 +59,40 @@ pub enum Request {
         /// single connected peer.
         to: Option<String>,
     },
+    /// List encrypted history entries (HIST-3). All filters are optional; a
+    /// missing filter means "no restriction". Content is included in the reply.
+    HistoryList {
+        /// Case-sensitive substring match against entry text.
+        search: Option<String>,
+        /// Restrict to clips originating from this device-id prefix.
+        device: Option<String>,
+        /// Only return starred entries when `Some(true)`.
+        starred: Option<bool>,
+        /// Maximum rows to return (defaults to 50).
+        limit: Option<usize>,
+        /// Pagination cursor: only entries with `ts_ms` strictly less than this.
+        before_ts: Option<u64>,
+    },
+    /// Star or unstar a history entry (HIST-3).
+    HistoryStar { id: i64, starred: bool },
+    /// Delete a single history entry (HIST-3).
+    HistoryDelete { id: i64 },
+    /// Read the persisted daemon configuration (`config.json`).
+    ConfigGet,
+    /// Change persisted configuration. Currently only `auto_file_sync` (FILE-1);
+    /// the running engine does not hot-reload it, so the reply reports
+    /// `restart_required: true`.
+    ConfigSet { auto_file_sync: Option<bool> },
+    /// Revoke a trusted peer by device-id prefix (PAIR-7), live in the engine.
+    Revoke { prefix: String },
+    /// Begin an on-screen pairing session (PAIR-2 GUI). Streams a `pairing`
+    /// line (URI + QR), then a `code` line once a peer connects, then blocks for
+    /// a [`Request::PairConfirm`] on the same connection, then a `result` line.
+    PairListenStart,
+    /// Accept or reject the pairing in progress on this connection (PAIR-2 GUI).
+    /// Only meaningful after a [`Request::PairListenStart`] has streamed a
+    /// `code` line on the same connection.
+    PairConfirm { accept: bool },
 }
 
 /// One peer row in a [`StatusResponse`].
@@ -85,6 +130,52 @@ pub enum SendUpdate {
     Error { message: String },
 }
 
+/// Everything an IPC connection may need to serve any command, assembled once
+/// by `ucb run` and shared (behind an `Arc`) across all connections.
+///
+/// The daemon stays the single engine process: the GUI is a thin frontend that
+/// issues these commands over the socket. History and pairing need more than the
+/// engine handle, so they are bundled here.
+pub struct IpcContext {
+    /// The running sync engine (status, send, revoke).
+    pub engine: Arc<SyncEngine>,
+    /// The encrypted history store, when history is enabled (HIST-3).
+    pub history: Option<Arc<History>>,
+    /// Filesystem layout (config file for config get/set, allowlist for pairing).
+    pub paths: Paths,
+    /// This device's identity, used to run the pairing handshake (PAIR-2).
+    pub identity: Arc<Identity>,
+    /// This device's display name, sent in the pairing `Hello`.
+    pub device_name: String,
+    /// This device's platform, sent in the pairing `Hello`.
+    pub platform: Platform,
+    /// Guards "one pairing at a time": set while a `pair_listen_start` is live so
+    /// a concurrent one is rejected.
+    pairing_active: Arc<AtomicBool>,
+}
+
+impl IpcContext {
+    /// Build the shared IPC context for `ucb run`.
+    pub fn new(
+        engine: Arc<SyncEngine>,
+        history: Option<Arc<History>>,
+        paths: Paths,
+        identity: Arc<Identity>,
+        device_name: String,
+        platform: Platform,
+    ) -> Self {
+        Self {
+            engine,
+            history,
+            paths,
+            identity,
+            device_name,
+            platform,
+            pairing_active: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Server (runs inside `ucb run`)
 // ---------------------------------------------------------------------------
@@ -112,13 +203,13 @@ pub fn bind(socket_path: &Path) -> Result<Listener> {
 /// Accept and serve IPC connections until the listener is dropped. Each
 /// connection is handled on its own task.
 #[cfg(unix)]
-pub async fn serve(listener: Listener, engine: Arc<SyncEngine>) {
+pub async fn serve(listener: Listener, ctx: Arc<IpcContext>) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
-                let engine = engine.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, engine).await {
+                    if let Err(e) = handle_conn(stream, ctx).await {
                         tracing::debug!(error = %e, "IPC connection ended with error");
                     }
                 });
@@ -134,13 +225,13 @@ pub async fn serve(listener: Listener, engine: Arc<SyncEngine>) {
 /// Accept and serve IPC connections until the listener stops producing new
 /// pipe instances. Each connection is handled on its own task.
 #[cfg(windows)]
-pub async fn serve(mut listener: Listener, engine: Arc<SyncEngine>) {
+pub async fn serve(mut listener: Listener, ctx: Arc<IpcContext>) {
     loop {
         match listener.accept().await {
             Ok(stream) => {
-                let engine = engine.clone();
+                let ctx = ctx.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_conn(stream, engine).await {
+                    if let Err(e) = handle_conn(stream, ctx).await {
                         tracing::debug!(error = %e, "IPC connection ended with error");
                     }
                 });
@@ -153,7 +244,7 @@ pub async fn serve(mut listener: Listener, engine: Arc<SyncEngine>) {
     }
 }
 
-async fn handle_conn<S>(stream: S, engine: Arc<SyncEngine>) -> Result<()>
+async fn handle_conn<S>(stream: S, ctx: Arc<IpcContext>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -168,15 +259,300 @@ where
 
     match request {
         Request::Status => {
-            let resp = status_snapshot(&engine);
+            let resp = status_snapshot(&ctx.engine);
             write_line(&mut write_half, &resp).await?;
         }
         Request::Send { path, to } => {
-            handle_send(&engine, &path, to.as_deref(), &mut write_half).await?;
+            handle_send(&ctx.engine, &path, to.as_deref(), &mut write_half).await?;
+        }
+        Request::HistoryList {
+            search,
+            device,
+            starred,
+            limit,
+            before_ts,
+        } => {
+            handle_history_list(&ctx, search, device, starred, limit, before_ts, &mut write_half)
+                .await?;
+        }
+        Request::HistoryStar { id, starred } => {
+            let ok = match &ctx.history {
+                Some(h) => h.set_starred(id, starred).unwrap_or(false),
+                None => false,
+            };
+            write_line(&mut write_half, &serde_json::json!({ "ok": ok })).await?;
+        }
+        Request::HistoryDelete { id } => {
+            let ok = match &ctx.history {
+                Some(h) => h.delete(id).unwrap_or(false),
+                None => false,
+            };
+            write_line(&mut write_half, &serde_json::json!({ "ok": ok })).await?;
+        }
+        Request::ConfigGet => {
+            let resp = match Config::load(&ctx.paths) {
+                Ok(cfg) => serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({})),
+                Err(e) => serde_json::json!({ "error": e.to_string() }),
+            };
+            write_line(&mut write_half, &resp).await?;
+        }
+        Request::ConfigSet { auto_file_sync } => {
+            let resp = handle_config_set(&ctx, auto_file_sync);
+            write_line(&mut write_half, &resp).await?;
+        }
+        Request::Revoke { prefix } => {
+            let resp = match ctx.engine.revoke_prefix(&prefix) {
+                Some((id, name)) => {
+                    serde_json::json!({ "ok": true, "id": id.to_string(), "name": name })
+                }
+                None => serde_json::json!({
+                    "ok": false,
+                    "detail": format!("no unique trusted device matches prefix {prefix:?}")
+                }),
+            };
+            write_line(&mut write_half, &resp).await?;
+        }
+        Request::PairListenStart => {
+            handle_pair_listen(&ctx, &mut reader, &mut write_half).await?;
+        }
+        Request::PairConfirm { .. } => {
+            write_line(
+                &mut write_half,
+                &serde_json::json!({
+                    "type": "error",
+                    "message": "pair_confirm is only valid after pair_listen_start on the same connection"
+                }),
+            )
+            .await?;
         }
     }
     write_half.flush().await?;
     Ok(())
+}
+
+/// Persist a `config_set` change and report the hot-reload limitation honestly.
+///
+/// `ucb run` reads `config.json` once at startup and does not watch it, so a
+/// change here only takes effect on the next daemon start — surfaced to the
+/// caller as `restart_required: true`.
+fn handle_config_set(ctx: &IpcContext, auto_file_sync: Option<bool>) -> serde_json::Value {
+    let mut config = match Config::load(&ctx.paths) {
+        Ok(c) => c,
+        Err(e) => return serde_json::json!({ "ok": false, "detail": e.to_string() }),
+    };
+    if let Some(v) = auto_file_sync {
+        config.auto_file_sync = v;
+    }
+    match config.save(&ctx.paths) {
+        Ok(()) => serde_json::json!({ "ok": true, "restart_required": true }),
+        Err(e) => serde_json::json!({ "ok": false, "detail": e.to_string() }),
+    }
+}
+
+/// Serve a `history_list` query, mirroring the CLI's device-prefix filtering:
+/// the store filters by full origin id only, so a device *prefix* is applied in
+/// Rust after over-fetching. Emits a single `{"entries":[...]}` line.
+async fn handle_history_list<W>(
+    ctx: &IpcContext,
+    search: Option<String>,
+    device: Option<String>,
+    starred: Option<bool>,
+    limit: Option<usize>,
+    before_ts: Option<u64>,
+    out: &mut W,
+) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let Some(history) = &ctx.history else {
+        write_line(out, &serde_json::json!({ "entries": [], "history": false })).await?;
+        return Ok(());
+    };
+
+    let want = limit.unwrap_or(ucb_history::DEFAULT_LIMIT);
+    let query = HistoryQuery {
+        text_search: search,
+        origin: None,
+        starred_only: starred.unwrap_or(false),
+        // Over-fetch when narrowing by a device prefix (filtered below).
+        limit: if device.is_some() { 100_000 } else { want },
+        before_ts,
+    };
+    let entries = match history.list(query) {
+        Ok(mut entries) => {
+            if let Some(prefix) = &device {
+                entries.retain(|e| e.origin_id.starts_with(prefix));
+                entries.truncate(want);
+            }
+            entries
+        }
+        Err(e) => {
+            write_line(out, &serde_json::json!({ "entries": [], "error": e.to_string() })).await?;
+            return Ok(());
+        }
+    };
+    write_line(out, &serde_json::json!({ "entries": entries })).await?;
+    Ok(())
+}
+
+/// Reset the "pairing in progress" flag when the pairing handler returns, so a
+/// panic or early error never wedges the single-pairing slot shut.
+struct PairingGuard(Arc<AtomicBool>);
+impl Drop for PairingGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Drive an on-screen pairing session over this one IPC connection (PAIR-2 GUI).
+///
+/// Because `ucb run` already owns the configured sync port, pairing binds a
+/// *fresh ephemeral* TCP listener and advertises that endpoint in the URI/QR —
+/// the peer dials it with `ucb pair --connect ucb://ip:port`. Only one pairing
+/// runs at a time; a concurrent request is rejected.
+///
+/// Bridge: `pair_listen`'s confirmation callback is synchronous, so it hands the
+/// 6-digit code to this async task over a channel and blocks (via
+/// `block_in_place`) on the user's decision, which arrives as a
+/// [`Request::PairConfirm`] line on this same connection.
+async fn handle_pair_listen<R, W>(ctx: &IpcContext, reader: &mut R, out: &mut W) -> Result<()>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    // One pairing at a time (PAIR-2): claim the slot or reject.
+    if ctx
+        .pairing_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        write_line(
+            out,
+            &serde_json::json!({
+                "type": "error",
+                "message": "another pairing is already in progress"
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+    let _guard = PairingGuard(ctx.pairing_active.clone());
+
+    // Bind a fresh ephemeral listener (the sync port is taken by the engine).
+    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", 0)).await {
+        Ok(l) => l,
+        Err(e) => {
+            write_line(
+                out,
+                &serde_json::json!({
+                    "type": "error",
+                    "message": format!("could not open a pairing listener: {e}")
+                }),
+            )
+            .await?;
+            return Ok(());
+        }
+    };
+    let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
+    let host = pairing::primary_local_ipv4()
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "0.0.0.0".to_string());
+    let uri = pairing::format_pairing_uri(&host, port);
+    let qr_text = pairing::render_qr(&uri).unwrap_or_default();
+
+    write_line(
+        out,
+        &serde_json::json!({ "type": "pairing", "uri": uri, "qr_text": qr_text }),
+    )
+    .await?;
+    out.flush().await?;
+
+    // Bridge channels: code out to us, the user's decision back to the callback.
+    let (code_tx, mut code_rx) = mpsc::unbounded_channel::<(String, DeviceInfo)>();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel::<bool>();
+    let mut decision_rx = Some(decision_rx);
+    let confirm = move |code: &str, peer: &DeviceInfo| -> bool {
+        if code_tx.send((code.to_string(), peer.clone())).is_err() {
+            return false; // the IPC connection went away
+        }
+        match decision_rx.take() {
+            Some(rx) => tokio::task::block_in_place(|| rx.blocking_recv()).unwrap_or(false),
+            None => false,
+        }
+    };
+
+    let identity = ctx.identity.clone();
+    let allowlist_path = ctx.paths.trusted_file.clone();
+    let device_name = ctx.device_name.clone();
+    let platform = ctx.platform;
+    let task = tokio::spawn(async move {
+        pair_listen(
+            listener,
+            identity.as_ref(),
+            allowlist_path,
+            &device_name,
+            platform,
+            confirm,
+        )
+        .await
+    });
+
+    // Wait for the handshake to produce a verification code (or fail first).
+    match code_rx.recv().await {
+        Some((code, device)) => {
+            write_line(
+                out,
+                &serde_json::json!({
+                    "type": "code",
+                    "code": code,
+                    "device": {
+                        "id": device.id.to_string(),
+                        "name": device.name,
+                        "platform": device.platform,
+                    }
+                }),
+            )
+            .await?;
+            out.flush().await?;
+
+            // Read the user's decision (PairConfirm) on this same connection.
+            let accept = read_pair_confirm(reader).await;
+            let _ = decision_tx.send(accept);
+        }
+        None => {
+            // The callback was never reached — the handshake failed before a
+            // code could be shown. Fall through to report the task's error.
+        }
+    }
+
+    let result = match task.await {
+        Ok(Ok(dev)) => serde_json::json!({ "type": "result", "ok": true, "name": dev.name }),
+        Ok(Err(e)) => {
+            serde_json::json!({ "type": "result", "ok": false, "message": e.to_string() })
+        }
+        Err(e) => serde_json::json!({
+            "type": "result", "ok": false, "message": format!("pairing task failed: {e}")
+        }),
+    };
+    write_line(out, &result).await?;
+    Ok(())
+}
+
+/// Read one line and interpret it as a [`Request::PairConfirm`]. A closed
+/// connection, a read error, or anything that is not `pair_confirm` counts as a
+/// rejection (fail-safe: never trust a peer without an explicit `accept:true`).
+async fn read_pair_confirm<R>(reader: &mut R) -> bool
+where
+    R: AsyncBufReadExt + Unpin,
+{
+    let mut line = String::new();
+    match reader.read_line(&mut line).await {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(
+            serde_json::from_str::<Request>(line.trim()),
+            Ok(Request::PairConfirm { accept: true })
+        ),
+    }
 }
 
 /// Build a [`StatusResponse`] from the engine's current peer view.
