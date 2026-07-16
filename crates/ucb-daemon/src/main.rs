@@ -642,11 +642,25 @@ async fn cmd_run(paths: &Paths, poll_ms: u64, headless_dir: Option<PathBuf>) -> 
     .await?;
     let engine = Arc::new(engine);
 
-    // Status/send IPC (UX-1): serve a unix socket in the config dir.
+    // IPC (UX-1 status/send + HIST-3/UX-2/PAIR-2 GUI commands): serve a unix
+    // socket in the config dir. The GUI is a frontend; the daemon stays the
+    // single engine process, so the context bundles everything a command needs
+    // (engine, history, config paths, identity for pairing) behind one socket.
+    let ipc_ctx = Arc::new(ipc::IpcContext::new(
+        engine.clone(),
+        history.clone(),
+        paths.clone(),
+        Arc::new(
+            Identity::load_or_generate(store.as_ref())
+                .context("reloading identity for the IPC pairing handler")?,
+        ),
+        config.name.clone(),
+        Platform::current(),
+    ));
     let ipc_task = match ipc::bind(&paths.socket_file) {
         Ok(listener) => {
             tracing::info!(socket = %paths.socket_file.display(), "status IPC listening");
-            Some(tokio::spawn(ipc::serve(listener, engine.clone())))
+            Some(tokio::spawn(ipc::serve(listener, ipc_ctx)))
         }
         Err(e) => {
             tracing::warn!(error = %e, "status IPC disabled: could not bind the daemon socket");

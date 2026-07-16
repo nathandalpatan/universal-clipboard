@@ -301,6 +301,30 @@ impl SyncEngine {
             .collect()
     }
 
+    /// Revoke a trusted peer by device-id hex *prefix* (PAIR-7), live.
+    ///
+    /// Resolves the prefix against the current allowlist (must match exactly one
+    /// trusted device), removes it from the allowlist, records a tombstone,
+    /// drops any live session, and broadcasts the revocation to connected peers
+    /// — all in the running engine, so no restart or disk re-read lag is
+    /// involved. Returns the revoked device's id and name, or `None` if no
+    /// unique trusted device matches the prefix.
+    ///
+    /// Used by the daemon IPC `revoke` command (the GUI's Devices view); the
+    /// out-of-process `ucb revoke` CLI writes the same tombstone to disk and the
+    /// engine converges on it via the periodic re-check.
+    pub fn revoke_prefix(&self, prefix: &str) -> Option<(DeviceId, String)> {
+        let (id, name) = {
+            let allowlist = self.shared.allowlist.lock().unwrap();
+            let id = allowlist.resolve_prefix(prefix)?;
+            let name = allowlist.name_of(&id).unwrap_or_default();
+            (id, name)
+        };
+        self.shared.apply_revocation(id);
+        self.shared.broadcast_revocations(&[id]);
+        Some((id, name))
+    }
+
     /// Send a file to a connected peer (FILE-1/4). With `target = Some(id)` the
     /// file goes to that peer (error if it is not connected); with `None` it goes
     /// to the single connected peer, erroring (and listing peers) when zero or

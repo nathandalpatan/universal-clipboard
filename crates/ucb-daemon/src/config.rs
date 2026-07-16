@@ -71,6 +71,7 @@ impl Config {
 }
 
 /// Resolved filesystem locations for the daemon's state.
+#[derive(Clone)]
 pub struct Paths {
     pub config_dir: PathBuf,
     pub config_file: PathBuf,
