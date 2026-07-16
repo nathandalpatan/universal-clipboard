@@ -9,7 +9,11 @@
       "mcp__claude_ai_Linear__create_issue_label",
       "mcp__claude_ai_Linear__save_issue",
       "Bash(mkdir -p apps/ucb-gui/src apps/ucb-gui/dist apps/ucb-gui/icons)",
-      "Bash(python3 -)"
+      "Bash(python3 -)",
+      "Bash(ping -c 1 -t 2 192.168.1.26)",
+      "Bash(ping -c 1 -t 2 192.168.1.55)",
+      "Bash(ifconfig -l)",
+      "Bash(systemextensionsctl list *)"
     ]
   }
 }
