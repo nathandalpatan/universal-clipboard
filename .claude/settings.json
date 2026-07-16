@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(echo \"exit: $?\")",
+      "Bash(defaults read *)",
+      "Bash(ping -c 2 -t 3 192.168.1.26)",
+      "Bash(nc -z -G 3 192.168.1.26 48521)",
+      "Bash(echo \"nc exit: $?\")",
+      "Bash(git add *)",
+      "Bash(git commit -q -m 'CLI usability: ucb info, ucb guide, help overhaul with quick start + examples *)"
+    ]
+  }
+}

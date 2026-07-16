@@ -1,6 +1,7 @@
 //! `ucb` — the Universal Clipboard daemon CLI.
 //!
-//! Subcommands: `init`, `pair`, `devices`, `revoke`, `peer`, `run`. See
+//! Subcommands: `init`, `info`, `guide`, `pair`, `devices`, `revoke`, `peer`,
+//! `run`. See
 //! ARCHITECTURE.md for the surrounding design. This binary wires the finished
 //! library crates together; all protocol logic lives in `ucb-sync` and below.
 //!
@@ -42,8 +43,145 @@ use config::{build_keystore, Config, Keystore, Paths, DEFAULT_PORT};
 use headless::FileClipboard;
 use ipc::SendUpdate;
 
+/// Shown under `ucb --help`. Kept short (< 20 lines) and copy-pasteable.
+const QUICK_START: &str = "\
+QUICK START:
+  1. ucb init                          set up this device (see it later with `ucb info`)
+  2. Pair two devices (same LAN):
+       ucb pair --listen                 on the first device
+       ucb pair --connect <addr>         on the second — then compare the 6-digit codes
+  3. ucb run                           on BOTH devices to start syncing
+  4. Copy text on one device; it lands on the other's clipboard.
+
+HANDY:
+  ucb info                             this device's identity and setup, any time
+  ucb history list                     browse synced clipboard history
+  ucb send <file>                      send a file to a connected peer
+  ucb config set-auto-file-sync true   sync files automatically, too
+  ucb service install                  start the daemon automatically at login
+
+New here? Run `ucb guide` for a full walkthrough, or `ucb <command> --help` for examples.";
+
+/// Printed verbatim by `ucb guide`. A plain-language, end-to-end walkthrough
+/// (no ANSI required) covering setup, pairing, everyday use, history, keeping the
+/// daemon running, and troubleshooting.
+const GUIDE: &str = "\
+==================================================================
+ universal-clipboard (ucb) — how to use this app
+==================================================================
+
+ucb keeps the clipboards of your own devices in sync over your local
+network, end-to-end encrypted. Copy on one machine, paste on another.
+Nothing leaves your LAN and no account or cloud is involved.
+
+------------------------------------------------------------------
+1. FIRST-TIME SETUP (once per device)
+------------------------------------------------------------------
+Run this on every machine you want to sync:
+
+    ucb init --name \"Work Laptop\"
+
+This generates a long-term key and derives this device's stable
+*device id* from it (the short 8-char form shows up in most output;
+the full hex is the whole fingerprint). The id is how other devices
+recognize and trust this one — it never changes unless you re-init.
+
+See your setup at any time with:
+
+    ucb info            (add --json for machine-readable output)
+
+------------------------------------------------------------------
+2. PAIRING TWO MACHINES (once per pair of devices)
+------------------------------------------------------------------
+Pairing establishes mutual trust. On the FIRST device:
+
+    ucb pair --listen
+
+It prints a `ucb://ip:port` address and, in a terminal, a scannable
+QR code. On the SECOND device, dial that address:
+
+    ucb pair --connect ucb://192.168.1.50:48521
+
+Both sides then show the SAME 6-digit code. Compare them out loud or
+on-screen; if they match, confirm on both. Mismatched codes mean you
+should abort — do not confirm.
+
+macOS gotchas:
+  * The first `--listen` may raise a firewall 'allow incoming
+    connections?' prompt — allow it.
+  * 'No route to host' on --connect almost always means the Local
+    Network permission is off for your terminal app (System Settings
+    > Privacy & Security > Local Network), or the other device is
+    asleep. Wake it and grant the permission, then retry.
+
+------------------------------------------------------------------
+3. EVERYDAY USE
+------------------------------------------------------------------
+Start the daemon on BOTH devices (leave it running):
+
+    ucb run
+
+Now copying text or an image on one device places it on the other's
+clipboard automatically. To send a specific file on demand:
+
+    ucb send ./report.pdf
+
+To sync files automatically as you copy them, turn on auto file sync:
+
+    ucb config set-auto-file-sync true
+
+Auto file sync has a 100 MiB per-file cap by default (adjustable in
+config.json). Received files land in the `received/` folder inside
+this device's config dir (see `ucb info` for the exact path).
+
+------------------------------------------------------------------
+4. HISTORY
+------------------------------------------------------------------
+Every synced clip is saved to an encrypted local history:
+
+    ucb history list                 newest first
+    ucb history list --search foo    filter by text
+    ucb history list --starred       only starred entries
+    ucb history star 42              keep entry 42 (exempt from cleanup)
+    ucb history delete 42            remove one entry
+
+------------------------------------------------------------------
+5. KEEPING IT RUNNING
+------------------------------------------------------------------
+Install a background service so the daemon starts at login:
+
+    ucb service install
+
+It writes the service definition and prints the exact command to
+activate it (launchctl/systemctl). Check on things with:
+
+    ucb status          live peer connection state
+    ucb service status   is the background service installed?
+
+------------------------------------------------------------------
+6. TROUBLESHOOTING
+------------------------------------------------------------------
+Peer shows offline?
+  * Confirm both daemons are running: `ucb status` on each.
+  * If mDNS/multicast is blocked on your network, add the peer's
+    address by hand so discovery isn't needed:
+        ucb peer add 192.168.1.50:48521
+  * If trust ever looks wrong, revoke and pair again:
+        ucb revoke <id-prefix>
+        ucb pair --listen   (then re-connect from the other side)
+  * For verbose logs while diagnosing:
+        RUST_LOG=debug ucb run
+
+That's it. Run `ucb <command> --help` for per-command examples.
+";
+
 #[derive(Parser)]
-#[command(name = "ucb", version, about = "End-to-end encrypted LAN clipboard sync")]
+#[command(
+    name = "ucb",
+    version,
+    about = "End-to-end encrypted LAN clipboard sync",
+    after_help = QUICK_START
+)]
 struct Cli {
     /// Store all state under this directory instead of the platform config dir.
     /// (Test/automation flag; makes the daemon fully sandboxable.)
@@ -56,6 +194,17 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Create the config dir, generate a device identity, and print it.
+    ///
+    /// Run this once per device. It generates a long-term key, derives this
+    /// device's stable id from it, and writes `config.json`. Safe to re-run: an
+    /// existing identity is loaded rather than regenerated.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb init                       set up with the hostname as the device name
+  ucb init --name \"Work Laptop\"  choose a friendly device name
+  ucb init --file-keystore       store the key in a 0600 file (headless Linux)
+
+After init, run `ucb info` to see your setup or `ucb guide` for a walkthrough.")]
     Init {
         /// Human-readable device name (defaults to the machine hostname).
         #[arg(long)]
@@ -69,12 +218,43 @@ enum Command {
         #[arg(long)]
         print_id: bool,
     },
+    /// Show this device's identity, settings, and daemon state at a glance.
+    ///
+    /// This is your "setup card" — viewable any time, not just at init. It reads
+    /// the local config and trust store, and (if `ucb run` is active) queries the
+    /// running daemon for a live peer summary.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb info          human-readable summary of this device
+  ucb info --json   the same data as one machine-readable JSON object")]
+    Info {
+        /// Emit everything as one machine-readable JSON object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print a full, plain-language walkthrough of how to use `ucb`.
+    ///
+    /// An end-to-end tutorial: first-time setup, pairing two machines, everyday
+    /// copy/paste and file transfer, history, keeping the daemon running, and
+    /// troubleshooting. Start here if you are new.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb guide            print the walkthrough
+  ucb guide | less     page through it")]
+    Guide,
     /// Pair with another device (run `--listen` on one, `--connect` on the other).
     ///
     /// On `--listen`, alongside the usual instructions the daemon prints a
     /// `ucb://ip:port` pairing URI (and, on a terminal, a scannable QR code) so
     /// the other device can connect even when mDNS discovery is blocked
     /// (DISC-3). `--connect` accepts either a bare `ip:port` or such a URI.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb pair --listen                          on device A: wait and show the address/QR + code
+  ucb pair --connect ucb://192.168.1.50:48521  on device B: dial A, then compare the 6-digit codes
+  ucb pair --listen --host 10.0.0.4          advertise a specific interface on a multi-homed host
+
+Confirm only when BOTH devices show the SAME 6-digit code.")]
     Pair {
         /// Wait for an incoming pairing connection on the configured port.
         #[arg(long, conflicts_with = "connect")]
@@ -97,8 +277,22 @@ enum Command {
         yes: bool,
     },
     /// List paired (trusted) devices.
+    ///
+    /// Shows each trusted device's short id and name; the full id is printed
+    /// beneath. Use a short-id prefix with `ucb revoke` or `ucb send --to`.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb devices   list every trusted device (short id + name + full id)")]
     Devices,
     /// Revoke a paired device by device-id prefix (PAIR-7).
+    ///
+    /// Revoking removes trust and writes a tombstone that blocks the device from
+    /// pairing again until you `--forget` it. The prefix is any unique leading
+    /// slice of the device id shown by `ucb devices`.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb revoke a1b2c3d4          revoke the device whose id starts a1b2c3d4
+  ucb revoke a1b2c3d4 --forget  clear its tombstone so it may be paired again")]
     Revoke {
         /// A prefix of the device id (as shown by `ucb devices`).
         prefix: String,
@@ -108,16 +302,40 @@ enum Command {
         forget: bool,
     },
     /// Manage manually-configured static peers (DISC-3).
+    ///
+    /// Static peers are dialed directly, so they work when mDNS/multicast
+    /// discovery is blocked on your network. Add the peer's `ip:port` on both
+    /// devices; changes take effect on the next `ucb run`.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb peer add 192.168.1.50:48521     reach a peer directly when mDNS is blocked
+  ucb peer list                       show configured static peers
+  ucb peer remove 192.168.1.50:48521  drop a static peer")]
     Peer {
         #[command(subcommand)]
         action: PeerAction,
     },
     /// View or change persisted daemon settings in `config.json`.
+    ///
+    /// Settings are read by `ucb run` at startup; changes take effect on the next
+    /// start.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb config show                      print the current configuration as JSON
+  ucb config set-auto-file-sync true   sync copied files automatically")]
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
     /// Run the sync daemon until Ctrl-C.
+    ///
+    /// Starts clipboard polling, mDNS discovery, the sync transport, encrypted
+    /// history, and the status/send IPC socket. Leave it running (or install a
+    /// background service — see `ucb service`) on every device you want in sync.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb run                    start syncing (Ctrl-C to stop)
+  RUST_LOG=debug ucb run     start with verbose logs for troubleshooting")]
     Run {
         /// Clipboard poll interval in milliseconds.
         #[arg(long, default_value_t = 300)]
@@ -130,12 +348,27 @@ enum Command {
         headless_dir: Option<PathBuf>,
     },
     /// Show peer connection state from the running daemon (UX-1).
+    ///
+    /// Queries the running `ucb run` over the IPC socket. Errors clearly if the
+    /// daemon is not running.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb status          human-readable peer connection state
+  ucb status --json   the raw status snapshot as JSON")]
     Status {
         /// Emit the raw status snapshot as JSON.
         #[arg(long)]
         json: bool,
     },
     /// Send a file to a connected peer via the running daemon (FILE-1).
+    ///
+    /// Hands the file to the running daemon, which streams it to the peer. With a
+    /// single connected peer `--to` is optional; otherwise pass a device-id prefix
+    /// (as shown by `ucb status`).
+    #[command(after_help = "\
+EXAMPLES:
+  ucb send ./report.pdf            send to the only connected peer
+  ucb send ./report.pdf --to a1b2  send to the peer whose id starts a1b2")]
     Send {
         /// Path of the file to send.
         path: PathBuf,
@@ -145,11 +378,30 @@ enum Command {
         to: Option<String>,
     },
     /// Browse and manage the encrypted local clipboard history (HIST-3).
+    ///
+    /// History is stored encrypted with the same key as your device identity.
+    /// List, search, star (to exempt from cleanup), and delete entries.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb history list                 recent clips, newest first
+  ucb history list --search token  only entries containing 'token'
+  ucb history list --starred       only starred entries
+  ucb history star 42              keep entry 42 (exempt from retention)")]
     History {
         #[command(subcommand)]
         action: HistoryAction,
     },
     /// Install or remove the background service that runs `ucb run` (BG-1/BG-6).
+    ///
+    /// Writes a launchd/systemd (or Windows SCM) definition that starts `ucb run`
+    /// at login. Install prints the exact activation command to run next unless
+    /// you pass `--activate` to run it for you.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb service install             write the definition; prints the activation command to run
+  ucb service install --activate  write it AND activate it now
+  ucb service status              is the service installed?
+  ucb service uninstall           remove the definition (prints the deactivation command)")]
     Service {
         #[command(subcommand)]
         action: ServiceAction,
@@ -260,6 +512,8 @@ async fn main() -> Result<()> {
             file_keystore,
             print_id,
         } => cmd_init(&paths, name, file_keystore, print_id),
+        Command::Info { json } => cmd_info(&paths, json).await,
+        Command::Guide => cmd_guide(),
         Command::Pair {
             listen,
             connect,
@@ -330,6 +584,159 @@ fn cmd_init(
     println!("  short id:    {}", identity.device_id().short());
     println!("  keystore:    {keystore:?}");
     println!("  config:      {}", paths.config_file.display());
+    println!();
+    println!("View this any time with `ucb info`.");
+    println!("New here? Run `ucb guide` for a full walkthrough.");
+    Ok(())
+}
+
+/// `ucb info` — device identity, settings, and live daemon state at a glance.
+///
+/// Reads the local config + trust store, and (if `ucb run` is active) queries the
+/// running daemon over the IPC socket for a live peer summary. With `json`, emits
+/// everything as one machine-readable object instead of the formatted report.
+async fn cmd_info(paths: &Paths, json: bool) -> Result<()> {
+    if !paths.config_file.exists() {
+        return Err(anyhow!(
+            "not set up on this device yet — run `ucb init` first \
+             (looked in {})",
+            paths.config_dir.display()
+        ));
+    }
+
+    let config = Config::load(paths)?;
+    let store = build_keystore(&config, paths);
+    let identity =
+        Identity::load_or_generate(store.as_ref()).context("loading the device identity")?;
+    let device_id = identity.device_id();
+    let platform = Platform::current();
+
+    // Trust store: paired devices + revocation tombstones.
+    let allowlist = Allowlist::load(&paths.trusted_file)?;
+    let paired = allowlist.list();
+    let revoked_count = allowlist.tombstones().len();
+
+    // Daemon liveness: a reachable socket means `ucb run` is serving.
+    let daemon = ipc::request_status(&paths.socket_file).await.ok();
+
+    if json {
+        let peers: Vec<serde_json::Value> = daemon
+            .as_ref()
+            .map(|s| {
+                s.peers
+                    .iter()
+                    .map(|p| {
+                        serde_json::json!({
+                            "id_short": p.id_short,
+                            "name": p.name,
+                            "connected": p.connected,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let out = serde_json::json!({
+            "name": config.name,
+            "id": device_id.to_string(),
+            "id_short": device_id.short(),
+            "platform": format!("{platform:?}"),
+            "listen_port": config.listen_port,
+            "keystore": format!("{:?}", config.keystore).to_lowercase(),
+            "config_dir": paths.config_dir.display().to_string(),
+            "protocol_version": PROTOCOL_VERSION,
+            "version": env!("CARGO_PKG_VERSION"),
+            "auto_file_sync": config.auto_file_sync,
+            "max_auto_file_bytes": config.max_auto_file_bytes,
+            "max_auto_file_bytes_human": human_bytes(config.max_auto_file_bytes),
+            "paired": paired
+                .iter()
+                .map(|d| serde_json::json!({ "id_short": d.device_id.short(), "name": d.name }))
+                .collect::<Vec<_>>(),
+            "paired_count": paired.len(),
+            "revoked_count": revoked_count,
+            "daemon_running": daemon.is_some(),
+            "peers": peers,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    println!("Device");
+    println!("  name:      {}", config.name);
+    println!("  id:        {}", device_id.short());
+    println!("  full id:   {device_id}");
+    println!("  platform:  {platform:?}");
+    println!();
+    println!("Setup");
+    println!("  listen port:    {}", config.listen_port);
+    println!("  keystore:       {:?}", config.keystore);
+    println!("  config dir:     {}", paths.config_dir.display());
+    println!("  protocol:       v{PROTOCOL_VERSION}");
+    println!("  binary:         v{}", env!("CARGO_PKG_VERSION"));
+    println!(
+        "  auto file sync: {} (cap {})",
+        config.auto_file_sync,
+        human_bytes(config.max_auto_file_bytes)
+    );
+    println!();
+    println!(
+        "Trusted devices ({} paired, {} revoked)",
+        paired.len(),
+        revoked_count
+    );
+    if paired.is_empty() {
+        println!("  none yet — run `ucb pair` to add one");
+    } else {
+        for d in &paired {
+            println!("  {}  {}", d.device_id.short(), d.name);
+        }
+    }
+    println!();
+    match &daemon {
+        Some(s) => {
+            let connected = s.peers.iter().filter(|p| p.connected).count();
+            println!(
+                "Daemon: running (v{}, protocol v{})",
+                s.version, s.protocol
+            );
+            println!(
+                "  peers: {} known, {} connected",
+                s.peers.len(),
+                connected
+            );
+            for p in &s.peers {
+                let state = if p.connected { "connected" } else { "offline" };
+                println!("    {:<10}  {:<24}  {}", p.id_short, p.name, state);
+            }
+        }
+        None => println!("Daemon: not running (start with `ucb run`)"),
+    }
+    Ok(())
+}
+
+/// Format a byte count in binary units (KiB/MiB/GiB), for human-readable output.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    // Drop a trailing `.0` so exact multiples read cleanly (e.g. "100 MiB").
+    if (v.fract()).abs() < 0.05 {
+        format!("{v:.0} {}", UNITS[i])
+    } else {
+        format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+/// `ucb guide` — a plain-language, end-to-end walkthrough printed to stdout.
+fn cmd_guide() -> Result<()> {
+    print!("{GUIDE}");
     Ok(())
 }
 
