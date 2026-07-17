@@ -143,6 +143,30 @@ code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; }
 }
 .banner.err { background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger); }
 
+/* HIST-6: sensitive-content blur + reveal. */
+.content.sensitive {
+  filter: blur(6px);
+  user-select: none;
+  cursor: pointer;
+  transition: filter .12s ease;
+}
+.sens-bar { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+.sens-badge {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .03em;
+  padding: 2px 7px; border-radius: 999px;
+  background: color-mix(in srgb, var(--danger) 16%, transparent); color: var(--danger);
+}
+.sens-eye { font-size: 12px; }
+
+/* HIST-5: locked-history overlay. */
+.empty.locked .lock-glyph { font-size: 30px; margin-bottom: 6px; }
+#history-locked { margin-top: 6px; }
+
+/* Settings toggles. */
+.toggle-row { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; }
+.toggle-row input[type=checkbox] { margin-top: 3px; width: 16px; height: 16px; }
+.toggle-sub { display: block; font-size: 12px; margin-top: 2px; }
+
 /* Spinner (UX-3): only revealed by JS after the 350ms threshold. */
 .spinner { width: 16px; height: 16px; display: none; }
 .spinner.show { display: inline-block; }

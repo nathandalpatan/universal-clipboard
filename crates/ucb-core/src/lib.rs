@@ -9,7 +9,9 @@ use std::fmt;
 /// Wire protocol version (SYNC-6). Bump on breaking protocol changes.
 /// v2: multi-format payloads (SYNC-4), revocation propagation (PAIR-7),
 /// file transfer messages (FILE-2..5).
-pub const PROTOCOL_VERSION: u16 = 2;
+/// v3: cross-device star sync (HIST-4) — adds `WireMessage::Star`. v2 peers are
+/// rejected at the Hello version check exactly like v1 (SYNC-6 as designed).
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Largest clipboard payload sent inline as a single Clip message.
 /// Anything larger must go through the file-transfer path (or be skipped
@@ -204,6 +206,12 @@ pub enum WireMessage {
     FileChunk { transfer_id: u64, index: u64, data: ChunkData },
     /// Receiver-side completion/abort notice.
     FileDone { transfer_id: u64, ok: bool, detail: String },
+    /// HIST-4: cross-device star sync. The sender starred (or unstarred) the
+    /// history entry with this content hash; a receiving trusted peer applies
+    /// the same star to every local history row with a matching hash. Carries
+    /// `ts_ms` (the originating device's clock) for observability/ordering;
+    /// application is idempotent and never re-broadcast, so no loop forms.
+    Star { content_hash: [u8; 32], starred: bool, ts_ms: u64 },
 }
 
 impl WireMessage {

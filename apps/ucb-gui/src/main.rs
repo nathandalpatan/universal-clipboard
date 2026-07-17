@@ -9,8 +9,13 @@
 // QR pairing), UX-3 groundwork (spinner threshold lives in the frontend).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod biometric;
+mod capture;
+mod sensitive;
+
 use std::path::PathBuf;
 
+use serde::Serialize;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
@@ -256,6 +261,56 @@ async fn pair_cancel(_state: tauri::State<'_, PairState>) -> Result<(), String> 
     Ok(())
 }
 
+// --- HIST-5/6/7 history-protection commands --------------------------------
+
+/// What this platform+device can enforce, so the frontend can adapt without
+/// ever showing a fake lock or a dead toggle.
+#[derive(Serialize)]
+struct Capabilities {
+    /// `std::env::consts::OS` (e.g. "macos", "windows", "linux").
+    os: String,
+    /// Whether screenshot/recording exclusion is enforced on this OS (HIST-7).
+    capture_protection: bool,
+    /// Whether biometric/device-owner auth is usable right now (HIST-5).
+    biometrics: bool,
+}
+
+#[tauri::command]
+fn platform_capabilities() -> Capabilities {
+    Capabilities {
+        os: std::env::consts::OS.to_string(),
+        capture_protection: cfg!(any(target_os = "macos", target_os = "windows")),
+        biometrics: biometric::available(),
+    }
+}
+
+/// HIST-7: toggle screenshot / screen-sharing exclusion on the main window.
+#[tauri::command]
+async fn set_capture_protection(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
+    if let Some(w) = app.get_webview_window("main") {
+        capture::apply(&w, enabled)?;
+    }
+    Ok(())
+}
+
+/// HIST-5: run the biometric prompt, unlocking the History view on success.
+#[tauri::command]
+async fn authenticate(reason: String) -> biometric::AuthResult {
+    biometric::authenticate(&reason).await
+}
+
+/// HIST-6: classify a batch of entry texts as sensitive (blur candidates).
+#[tauri::command]
+fn is_sensitive_batch(texts: Vec<String>) -> Vec<bool> {
+    texts.iter().map(|t| sensitive::is_sensitive(t)).collect()
+}
+
+/// HIST-6: classify a single text (kept for completeness / ad-hoc checks).
+#[tauri::command]
+fn is_sensitive(text: String) -> bool {
+    sensitive::is_sensitive(&text)
+}
+
 fn main() {
     tauri::Builder::default()
         .manage(PairState::default())
@@ -291,6 +346,13 @@ fn main() {
                 tray = tray.icon(icon);
             }
             tray.build(app)?;
+
+            // HIST-7: exclude the window from screen capture by default (secure
+            // default = ON). The frontend re-applies the persisted preference on
+            // boot, so an OFF preference is honored immediately after load.
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = capture::apply(&w, true);
+            }
 
             // UX-2: poll daemon status every 3s and reflect it in the tray label.
             let item = status_item.clone();
@@ -333,6 +395,11 @@ fn main() {
             pair_start,
             pair_confirm,
             pair_cancel,
+            platform_capabilities,
+            set_capture_protection,
+            authenticate,
+            is_sensitive_batch,
+            is_sensitive,
         ])
         .run(tauri::generate_context!())
         .expect("error while running the Universal Clipboard GUI");

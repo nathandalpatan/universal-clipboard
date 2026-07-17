@@ -276,8 +276,19 @@ where
                 .await?;
         }
         Request::HistoryStar { id, starred } => {
+            // Star locally, then broadcast the change by content hash so peers'
+            // history converges (HIST-4). The engine applies inbound stars
+            // idempotently and never re-broadcasts, so no loop forms.
             let ok = match &ctx.history {
-                Some(h) => h.set_starred(id, starred).unwrap_or(false),
+                Some(h) => {
+                    let ok = h.set_starred(id, starred).unwrap_or(false);
+                    if ok {
+                        if let Ok(Some(hash)) = h.starred_hash_of(id) {
+                            ctx.engine.broadcast_star(hash, starred);
+                        }
+                    }
+                    ok
+                }
                 None => false,
             };
             write_line(&mut write_half, &serde_json::json!({ "ok": ok })).await?;

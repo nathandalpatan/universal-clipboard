@@ -18,7 +18,8 @@ mod rate_limit;
 
 pub use allowlist::{Allowlist, TrustedDevice};
 pub use engine::{
-    EngineConfig, PeerStatus, SendProgress, SendReport, SyncEngine, DEFAULT_MAX_AUTO_FILE_BYTES,
+    DiscoveredPeer, EngineConfig, PeerStatus, SendProgress, SendReport, SyncEngine, TransferEvent,
+    DEFAULT_MAX_AUTO_FILE_BYTES,
 };
 pub use error::{Error, Result};
 pub use pairing::{pair_dial, pair_listen, ConfirmPairing};
