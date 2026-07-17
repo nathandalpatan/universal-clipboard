@@ -306,6 +306,43 @@ impl History {
         Ok(n > 0)
     }
 
+    /// The content hash of the entry with `id`, or `None` if no such row.
+    ///
+    /// Used by the daemon (HIST-4) to learn which content a just-starred row
+    /// refers to, so the star can be broadcast to peers by hash.
+    pub fn starred_hash_of(&self, id: i64) -> Result<Option<[u8; 32]>> {
+        let conn = self.conn.lock().expect("history mutex poisoned");
+        let hash: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT content_hash FROM items WHERE id = ?1",
+                params![id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(hash.and_then(|v| {
+            if v.len() == 32 {
+                let mut out = [0u8; 32];
+                out.copy_from_slice(&v);
+                Some(out)
+            } else {
+                None
+            }
+        }))
+    }
+
+    /// Set (or clear) the starred flag on every entry whose content hash equals
+    /// `hash` (HIST-4 star sync). Returns the number of rows updated (0 when no
+    /// row matches). Idempotent: re-applying the same value is a harmless no-op
+    /// that still reports the matching row count.
+    pub fn set_starred_by_hash(&self, hash: &[u8; 32], starred: bool) -> Result<u64> {
+        let conn = self.conn.lock().expect("history mutex poisoned");
+        let n = conn.execute(
+            "UPDATE items SET starred = ?1 WHERE content_hash = ?2",
+            params![starred as i64, &hash[..]],
+        )?;
+        Ok(n as u64)
+    }
+
     /// Delete a single entry. Returns whether a row matched.
     pub fn delete(&self, id: i64) -> Result<bool> {
         let conn = self.conn.lock().expect("history mutex poisoned");
@@ -691,6 +728,61 @@ mod tests {
         let removed = hist.delete_all().unwrap();
         assert_eq!(removed, 2);
         assert_eq!(hist.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn set_starred_by_hash_matches_content_and_reports_count() {
+        let dir = temp_dir("star-by-hash");
+        let (hist, _ks) = open_store(&dir);
+
+        // Two rows with distinct content; capture their hashes.
+        let id_a = hist.record(&text_item("alpha", 1, 1), "a").unwrap();
+        hist.record(&text_item("beta", 2, 1), "a").unwrap();
+        let hash_a = hist.starred_hash_of(id_a).unwrap().expect("hash for alpha");
+
+        // Starring by hash flips exactly the matching row.
+        assert_eq!(hist.set_starred_by_hash(&hash_a, true).unwrap(), 1);
+        let starred = hist
+            .list(HistoryQuery { starred_only: true, ..Default::default() })
+            .unwrap();
+        assert_eq!(starred.len(), 1);
+        assert_eq!(starred[0].id, id_a);
+
+        // Idempotent: applying again still reports the matching row count.
+        assert_eq!(hist.set_starred_by_hash(&hash_a, true).unwrap(), 1);
+
+        // Unstar by hash clears it.
+        assert_eq!(hist.set_starred_by_hash(&hash_a, false).unwrap(), 1);
+        assert!(hist
+            .list(HistoryQuery { starred_only: true, ..Default::default() })
+            .unwrap()
+            .is_empty());
+
+        // No-match hash updates nothing.
+        assert_eq!(hist.set_starred_by_hash(&[0xAB; 32], true).unwrap(), 0);
+    }
+
+    #[test]
+    fn set_starred_by_hash_updates_all_duplicate_content_rows() {
+        let dir = temp_dir("star-dupes");
+        let (hist, _ks) = open_store(&dir);
+
+        // Same content, non-adjacent (a different clip between) so both rows
+        // persist rather than dedupe.
+        hist.record(&text_item("dup", 10, 1), "a").unwrap();
+        hist.record(&text_item("mid", 20, 1), "a").unwrap();
+        hist.record(&text_item("dup", 30, 1), "a").unwrap();
+        assert_eq!(hist.count().unwrap(), 3);
+
+        let hash = text_item("dup", 0, 1).content_hash();
+        assert_eq!(hist.set_starred_by_hash(&hash, true).unwrap(), 2, "both dup rows star");
+    }
+
+    #[test]
+    fn starred_hash_of_none_for_missing_row() {
+        let dir = temp_dir("hash-of");
+        let (hist, _ks) = open_store(&dir);
+        assert!(hist.starred_hash_of(9999).unwrap().is_none());
     }
 
     #[test]

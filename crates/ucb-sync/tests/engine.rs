@@ -17,7 +17,7 @@ use ucb_core::{DeviceId, Platform};
 use ucb_crypto::{FileKeyStore, Identity};
 use ucb_discovery::{Peer, PeerEvent};
 use ucb_history::{History, HistoryQuery};
-use ucb_sync::{Allowlist, EngineConfig, SyncEngine};
+use ucb_sync::{Allowlist, EngineConfig, SyncEngine, TransferEvent};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(10);
@@ -198,6 +198,24 @@ async fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> Option<T> {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// Drain a transfer-event receiver until `stop` matches (inclusive), or the
+/// timeout elapses between events. Returns everything collected.
+async fn collect_until(
+    rx: &mut tokio::sync::broadcast::Receiver<TransferEvent>,
+    stop: impl Fn(&TransferEvent) -> bool,
+) -> Vec<TransferEvent> {
+    let mut out = Vec::new();
+    // Lagged, closed, or timed-out recv ends the loop with what we have.
+    while let Ok(Ok(ev)) = tokio::time::timeout(TIMEOUT, rx.recv()).await {
+        let done = stop(&ev);
+        out.push(ev);
+        if done {
+            break;
+        }
+    }
+    out
 }
 
 /// SYNC-1: a copy on A appears on B, and there is no echo loop.
@@ -588,9 +606,82 @@ async fn file_transfer_end_to_end() {
     let src = dir_a.join("payload.bin");
     tokio::fs::write(&src, &bytes).await.unwrap();
 
+    // Subscribe to transfer events on both sides BEFORE sending so nothing is
+    // missed (broadcast delivers only post-subscription events).
+    let mut rx_recv = node_b.engine.subscribe_transfers();
+    let mut rx_send = node_a.engine.subscribe_transfers();
+
     let report = node_a.engine.send_file(&src, None, None).await.unwrap();
     assert!(report.ok, "transfer should succeed: {report:?}");
     assert_eq!(report.bytes, bytes.len() as u64);
+
+    // Receiver-side ordering: RecvStarted -> RecvProgress(>=1) -> RecvCompleted.
+    let recv_events = collect_until(&mut rx_recv, |e| {
+        matches!(e, TransferEvent::RecvCompleted { .. })
+    })
+    .await;
+    let total_size = bytes.len() as u64;
+    match &recv_events[0] {
+        TransferEvent::RecvStarted { name, size, from, .. } => {
+            assert!(name.ends_with("payload.bin"), "started name: {name}");
+            assert_eq!(*size, total_size, "RecvStarted size must be the file size");
+            assert_eq!(*from, dev_a, "RecvStarted must name the sender");
+        }
+        other => panic!("first receiver event must be RecvStarted, got {other:?}"),
+    }
+    let progress: Vec<(u64, u64)> = recv_events
+        .iter()
+        .filter_map(|e| match e {
+            TransferEvent::RecvProgress { received, total, .. } => Some((*received, *total)),
+            _ => None,
+        })
+        .collect();
+    assert!(!progress.is_empty(), "expected at least one RecvProgress event");
+    assert!(
+        progress.iter().all(|(_, total)| *total == 3),
+        "chunk total must be 3 (600KiB+123 over 256KiB chunks): {progress:?}"
+    );
+    assert!(
+        progress.windows(2).all(|w| w[0].0 <= w[1].0),
+        "RecvProgress received counts must be monotonic: {progress:?}"
+    );
+    match recv_events.last().unwrap() {
+        TransferEvent::RecvCompleted { ok, path, .. } => {
+            assert!(*ok, "RecvCompleted must be ok");
+            assert!(path.ends_with("payload.bin"), "completed path: {path:?}");
+        }
+        other => panic!("last receiver event must be RecvCompleted, got {other:?}"),
+    }
+
+    // Sender-side ordering: SendProgress(>=1) -> SendCompleted. Progress is in
+    // chunk counts (same plumbing as the CLI's SendProgress), total == 3 chunks.
+    let send_events = collect_until(&mut rx_send, |e| {
+        matches!(e, TransferEvent::SendCompleted { .. })
+    })
+    .await;
+    let send_progress: Vec<(u64, u64)> = send_events
+        .iter()
+        .filter_map(|e| match e {
+            TransferEvent::SendProgress { sent, total, .. } => Some((*sent, *total)),
+            _ => None,
+        })
+        .collect();
+    assert!(!send_progress.is_empty(), "expected at least one SendProgress event");
+    assert!(
+        send_progress.iter().all(|(_, total)| *total == 3),
+        "SendProgress chunk total must be 3: {send_progress:?}"
+    );
+    assert!(
+        send_progress.windows(2).all(|w| w[0].0 <= w[1].0),
+        "SendProgress sent counts must be monotonic: {send_progress:?}"
+    );
+    match send_events.last().unwrap() {
+        TransferEvent::SendCompleted { ok, name, .. } => {
+            assert!(*ok, "SendCompleted must be ok");
+            assert!(name.ends_with("payload.bin"), "completed name: {name}");
+        }
+        other => panic!("last sender event must be SendCompleted, got {other:?}"),
+    }
 
     // B's clipboard should end up holding the received file as a file reference.
     let clip_files = wait_for(|| node_b.handle.get_files())
@@ -860,4 +951,129 @@ async fn auto_file_sync_skips_directory() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(count_files(&dir_b.join("received")), 0, "directory must be skipped");
     assert_eq!(node_b.handle.get_files(), None);
+}
+
+// --- HIST-4: cross-device star sync --------------------------------------
+
+/// HIST-4: starring a history entry on A (and broadcasting it) stars the
+/// matching content on B; unstarring propagates the same way; and because a
+/// received `Star` is never re-broadcast, the group stays quiescent (no loop).
+#[tokio::test]
+async fn star_syncs_a_to_b_and_does_not_loop() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("star").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+
+    let hist_a = Arc::new(
+        History::open(&dir_a.join("history.db"), &FileKeyStore::new(dir_a.join("hkeys"))).unwrap(),
+    );
+    let hist_b = Arc::new(
+        History::open(&dir_b.join("history.db"), &FileKeyStore::new(dir_b.join("hkeys"))).unwrap(),
+    );
+
+    let (node_a, port_a) = start_node_full(
+        "A",
+        id_a,
+        dir_a.join("trusted.json"),
+        vec![],
+        Some(hist_a.clone()),
+        None,
+    )
+    .await;
+    let (node_b, port_b) = start_node_full(
+        "B",
+        id_b,
+        dir_b.join("trusted.json"),
+        vec![],
+        Some(hist_b.clone()),
+        None,
+    )
+    .await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    // A copies content that syncs to B, so both stores hold a row for it.
+    node_a.handle.set("star-target");
+    let got = wait_for(|| node_b.handle.get().filter(|s| s == "star-target").map(|_| ())).await;
+    assert!(got.is_some(), "clip did not sync A -> B");
+
+    // Both stores must have recorded the clip before we star it.
+    let by_text = |hist: &History| -> Option<ucb_history::HistoryEntry> {
+        hist.list(HistoryQuery {
+            text_search: Some("star-target".to_string()),
+            ..Default::default()
+        })
+        .unwrap()
+        .into_iter()
+        .next()
+    };
+    let a_entry = wait_for(|| by_text(&hist_a)).await.expect("A recorded the clip");
+    wait_for(|| by_text(&hist_b)).await.expect("B recorded the clip");
+
+    // Star on A (local) then broadcast by content hash.
+    assert!(hist_a.set_starred(a_entry.id, true).unwrap());
+    let hash = hist_a.starred_hash_of(a_entry.id).unwrap().expect("hash of A's row");
+    node_a.engine.broadcast_star(hash, true);
+
+    // B's matching row becomes starred.
+    let b_starred = wait_for(|| by_text(&hist_b).filter(|e| e.starred).map(|_| ())).await;
+    assert!(b_starred.is_some(), "star did not propagate A -> B");
+
+    // Unstar on A + broadcast -> B unstars too.
+    assert!(hist_a.set_starred(a_entry.id, false).unwrap());
+    node_a.engine.broadcast_star(hash, false);
+    let b_unstarred = wait_for(|| by_text(&hist_b).filter(|e| !e.starred).map(|_| ())).await;
+    assert!(b_unstarred.is_some(), "unstar did not propagate A -> B");
+
+    // Quiescence / no-loop: B never re-broadcasts a received star, so A's row
+    // (unstarred by the caller above only via its own set) must stay stable and
+    // B must not flip back to starred.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!by_text(&hist_b).unwrap().starred, "B star flipped back (loop?)");
+    // A was never sent a Star by B, so A's local state is exactly what we set.
+    assert!(!by_text(&hist_a).unwrap().starred, "A star changed unexpectedly");
+}
+
+// --- Additive engine surface: discovered() -------------------------------
+
+/// `discovered()` lists every peer mDNS has seen — an untrusted `Found` peer
+/// with `trusted:false`, and a trusted peer with a live session as
+/// `connected:true`.
+#[tokio::test]
+async fn discovered_lists_untrusted_and_trusted_connected_peers() {
+    let (dir_a, dir_b, id_a, id_b) = trusted_pair("disc").await;
+    let (dev_a, dev_b) = (id_a.device_id(), id_b.device_id());
+    let (node_a, port_a) = start_node("A", id_a, dir_a.join("trusted.json")).await;
+    let (node_b, port_b) = start_node("B", id_b, dir_b.join("trusted.json")).await;
+    link(&node_a, port_a, dev_a, &node_b, port_b, dev_b).await;
+
+    // Inject an untrusted discovered peer X into A (never in A's allowlist).
+    let dev_x = DeviceId([0x9A; 32]);
+    node_a
+        .disc_tx
+        .send(peer_event(dev_x, "X-device", 40404))
+        .await
+        .unwrap();
+
+    let ok = wait_for(|| {
+        let d = node_a.engine.discovered();
+        let x = d.iter().find(|p| p.device_id == dev_x);
+        let b = d.iter().find(|p| p.device_id == dev_b);
+        match (x, b) {
+            (Some(x), Some(b))
+                if !x.trusted
+                    && !x.connected
+                    && x.name == "X-device"
+                    && b.trusted
+                    && b.connected =>
+            {
+                Some(())
+            }
+            _ => None,
+        }
+    })
+    .await;
+    assert!(
+        ok.is_some(),
+        "discovered() must show untrusted X and trusted-connected B: {:?}",
+        node_a.engine.discovered()
+    );
 }

@@ -16,6 +16,7 @@
         <button class="tab is-active" data-view="devices">Devices</button>
         <button class="tab" data-view="pair">Pair</button>
         <button class="tab" data-view="history">History</button>
+        <button class="tab" data-view="settings">Settings</button>
       </nav>
     </header>
 
@@ -75,15 +76,52 @@
           <h1>History</h1>
           <span class="spinner" id="history-spin"></span>
         </div>
-        <div class="filters">
-          <input type="search" id="hist-search" placeholder="Search text…" />
-          <select id="hist-device"><option value="">All devices</option></select>
-          <label class="check"><input type="checkbox" id="hist-starred" /> Starred only</label>
-          <button class="btn small" id="hist-apply">Apply</button>
+
+        <!-- HIST-5: biometric lock overlay (macOS Touch ID). Hidden on
+             platforms without biometric support — history renders directly. -->
+        <div id="history-locked" class="empty locked" hidden>
+          <div class="lock-glyph">🔒</div>
+          <h2>History is locked</h2>
+          <p class="muted" id="history-locked-msg">Authenticate to view your clipboard history.</p>
+          <button class="btn primary" id="history-unlock">Unlock</button>
         </div>
-        <div id="history-body"></div>
-        <div class="center">
-          <button class="btn small ghost" id="hist-more" hidden>Load more</button>
+
+        <div id="history-content">
+          <div class="filters">
+            <input type="search" id="hist-search" placeholder="Search text…" />
+            <select id="hist-device"><option value="">All devices</option></select>
+            <label class="check"><input type="checkbox" id="hist-starred" /> Starred only</label>
+            <button class="btn small" id="hist-apply">Apply</button>
+          </div>
+          <div id="history-body"></div>
+          <div class="center">
+            <button class="btn small ghost" id="hist-more" hidden>Load more</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section id="view-settings" class="view">
+        <div class="view-head"><h1>Settings</h1></div>
+
+        <div class="card">
+          <label class="toggle-row">
+            <input type="checkbox" id="set-capture" checked />
+            <span>
+              <strong>Hide window from screenshots &amp; screen sharing</strong>
+              <span class="muted toggle-sub" id="capture-note">
+                Excludes this window from screen captures and screen sharing.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div class="card">
+          <h2>History lock</h2>
+          <p class="muted" id="biometric-note">
+            The History view is protected by Touch ID. It unlocks for 5 minutes,
+            and re-locks if the window stays unfocused for over a minute.
+          </p>
         </div>
       </section>
     </main>

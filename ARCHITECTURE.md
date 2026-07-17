@@ -123,6 +123,27 @@ Never sideways or upward.
 - **Netem harness (TEST-2):** `scripts/harness-test.sh --netem` re-runs the
   two-device sync check under `latency` (200ms±50ms) and `loss` (10%) `tc`
   presets in addition to the baseline.
+- **Protocol v3 (HIST-4):** `PROTOCOL_VERSION = 3` adds
+  `WireMessage::Star { content_hash, starred, ts_ms }`. v2 (and v1) peers are
+  rejected at the Hello version check (SYNC-6 as designed) — this is an
+  accepted, breaking bump; all devices must be on v3 to sync.
+- **Star sync (HIST-4):** starring a history entry propagates by content hash.
+  `History::set_starred_by_hash(hash, starred)` applies to every matching row;
+  `History::starred_hash_of(id)` lets the daemon learn a just-starred row's
+  hash. `SyncEngine::broadcast_star(hash, starred)` sends `Star` to all live
+  sessions; an inbound `Star` from a trusted session applies
+  `set_starred_by_hash` via `spawn_blocking` and is **never** re-broadcast, so
+  no loop forms. The daemon's IPC `history_star` calls `broadcast_star` after a
+  successful local star (the engine holds the `Arc`); the bare `ucb history
+  star|unstar` CLI has no daemon/engine and stars only the local DB.
+- **New engine surfaces (GUI wave, additive):** `SyncEngine::discovered()`
+  returns `Vec<DiscoveredPeer>` — every mDNS-discovered peer (trusted or not,
+  connected or not; names/endpoints for untrusted peers are now retained in the
+  peers map). `SyncEngine::subscribe_transfers()` returns a
+  `broadcast::Receiver<TransferEvent>` carrying recv/send lifecycle events
+  (Started/Progress/Completed) emitted from the existing transfer paths — names,
+  sizes, chunk counts, and paths only, never file contents (SEC-2). Neither
+  changes `PeerStatus`/`status()`.
 
 ## Conventions
 

@@ -35,7 +35,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use ucb_clipboard::{ClipboardEvent, ClipboardWriter};
@@ -90,6 +90,43 @@ enum Outbound {
     Clip(ClipboardItem),
     Revoke(DeviceId),
     Raw(WireMessage),
+    /// HIST-4: a local star/unstar to propagate to a peer.
+    Star { content_hash: [u8; 32], starred: bool, ts_ms: u64 },
+}
+
+/// Capacity of the transfer-event broadcast channel (GUI surface). Lagging
+/// subscribers drop the oldest events; transfer events are advisory.
+const TRANSFER_EVENT_CAP: usize = 256;
+
+/// A peer the engine currently knows about from discovery (DISC-1/4), whether or
+/// not it is trusted or connected. Additive read surface for the GUI.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DiscoveredPeer {
+    pub device_id: DeviceId,
+    pub name: String,
+    pub addrs: Vec<IpAddr>,
+    pub port: u16,
+    /// In this device's allowlist (and not tombstoned-out of it).
+    pub trusted: bool,
+    /// A live session is currently established with this peer.
+    pub connected: bool,
+}
+
+/// File-transfer lifecycle events, broadcast for the GUI to render progress
+/// (SEC-2: never carries file contents — only names, sizes, and paths).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TransferEvent {
+    /// An inbound offer was accepted; the transfer is beginning.
+    RecvStarted { transfer_id: u64, name: String, size: u64, from: DeviceId },
+    /// Progress on an inbound transfer, in chunk counts (throttled).
+    RecvProgress { transfer_id: u64, received: u64, total: u64 },
+    /// An inbound transfer finished (`ok` distinguishes success from failure).
+    RecvCompleted { transfer_id: u64, path: PathBuf, ok: bool, detail: String },
+    /// Progress on an outbound transfer, in chunk counts (mirrors the existing
+    /// `SendProgress` plumbing).
+    SendProgress { transfer_id: u64, sent: u64, total: u64 },
+    /// An outbound transfer finished (`ok` distinguishes success from failure).
+    SendCompleted { transfer_id: u64, ok: bool, name: String, detail: String },
 }
 
 /// Progress of an outbound file transfer (FILE-4), for the CLI/IPC to surface.
@@ -166,9 +203,12 @@ struct SessionEntry {
     tx: mpsc::Sender<Outbound>,
 }
 
-/// The last-known network endpoint for a discovered peer.
+/// The last-known network endpoint for a discovered peer. Retained for every
+/// discovered peer (trusted or not) so the GUI's [`SyncEngine::discovered`]
+/// surface can list untrusted peers too.
 #[derive(Clone)]
 struct Endpoint {
+    name: String,
     addrs: Vec<IpAddr>,
     port: u16,
 }
@@ -207,6 +247,9 @@ struct Shared {
     /// FILE-4: routes inbound `FileAccept/FileReject/FileDone` for an outbound
     /// transfer (keyed by `transfer_id`) to its running send-pump task.
     send_routes: Mutex<HashMap<u64, mpsc::Sender<WireMessage>>>,
+    /// Transfer-event fan-out for the GUI (additive surface). Held even with no
+    /// subscribers; sends are best-effort.
+    transfers: broadcast::Sender<TransferEvent>,
 }
 
 /// The running sync engine. Holds its background tasks; dropping it aborts them.
@@ -257,6 +300,7 @@ impl SyncEngine {
             auto_file_sync: config.auto_file_sync,
             max_auto_file_bytes: config.max_auto_file_bytes,
             send_routes: Mutex::new(HashMap::new()),
+            transfers: broadcast::channel(TRANSFER_EVENT_CAP).0,
         });
 
         let mut tasks = vec![
@@ -299,6 +343,50 @@ impl SyncEngine {
                 name: d.name,
             })
             .collect()
+    }
+
+    /// Every peer currently known from discovery (DISC-1/4), trusted or not,
+    /// connected or not — the additive read surface the GUI's peer list uses.
+    /// Unlike [`status`](Self::status) (which lists the *allowlist*), this lists
+    /// what mDNS has seen, so it can surface pair-able untrusted devices.
+    pub fn discovered(&self) -> Vec<DiscoveredPeer> {
+        // Snapshot each lock independently (release before taking the next) to
+        // avoid holding multiple engine locks at once.
+        let peers: Vec<(DeviceId, Endpoint)> = self
+            .shared
+            .peers
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, ep)| (*id, ep.clone()))
+            .collect();
+        let connected: std::collections::HashSet<DeviceId> =
+            self.shared.sessions.lock().unwrap().keys().copied().collect();
+        let allowlist = self.shared.allowlist.lock().unwrap();
+        peers
+            .into_iter()
+            .map(|(id, ep)| DiscoveredPeer {
+                device_id: id,
+                name: ep.name,
+                addrs: ep.addrs,
+                port: ep.port,
+                trusted: allowlist.is_trusted(&id) && !allowlist.is_tombstoned(&id),
+                connected: connected.contains(&id),
+            })
+            .collect()
+    }
+
+    /// Subscribe to file-transfer lifecycle events (GUI surface). Each call
+    /// returns a fresh receiver; only events sent after subscription are seen.
+    pub fn subscribe_transfers(&self) -> broadcast::Receiver<TransferEvent> {
+        self.shared.transfers.subscribe()
+    }
+
+    /// HIST-4: broadcast a star/unstar (by content hash) to every connected
+    /// session. Call after a successful local star so peers converge. A received
+    /// `Star` is applied but never re-broadcast, so this cannot loop.
+    pub fn broadcast_star(&self, content_hash: [u8; 32], starred: bool) {
+        self.shared.broadcast_star(content_hash, starred);
     }
 
     /// Revoke a trusted peer by device-id hex *prefix* (PAIR-7), live.
@@ -477,13 +565,28 @@ impl Shared {
 
         let (result_tx, result_rx) = oneshot::channel();
         tokio::spawn(send_pump(
-            transfer, offer, out_tx, inbound_rx, progress, result_tx,
+            transfer,
+            offer,
+            out_tx,
+            inbound_rx,
+            progress,
+            self.transfers.clone(),
+            result_tx,
         ));
 
         let report = result_rx
             .await
             .map_err(|_| Error::Other("file send task ended without a result".to_string()));
         self.send_routes.lock().unwrap().remove(&transfer_id);
+        // Announce the outcome on the GUI transfer surface (SEC-2: name only).
+        if let Ok(r) = &report {
+            self.emit_transfer(TransferEvent::SendCompleted {
+                transfer_id,
+                ok: r.ok,
+                name: r.name.clone(),
+                detail: r.detail.clone(),
+            });
+        }
         report
     }
 
@@ -728,7 +831,7 @@ impl Shared {
                 inbound = chan.recv() => {
                     match inbound {
                         Ok(msg) => {
-                            match self.handle_inbound_msg(&mut chan, &mut guard, &peer_name, &mut recvs, msg).await {
+                            match self.handle_inbound_msg(&mut chan, &mut guard, peer_id, &peer_name, &mut recvs, msg).await {
                                 Ok(applied) => {
                                     if applied && !settled {
                                         early_applied += 1;
@@ -753,6 +856,10 @@ impl Shared {
                                     m
                                 }
                                 Outbound::Revoke(device) => WireMessage::Revoke { device },
+                                // HIST-4: propagate a local star/unstar.
+                                Outbound::Star { content_hash, starred, ts_ms } => {
+                                    WireMessage::Star { content_hash, starred, ts_ms }
+                                }
                                 // FILE-4: file offer/chunk built by a send-pump task.
                                 Outbound::Raw(m) => m,
                             };
@@ -794,6 +901,7 @@ impl Shared {
         &self,
         chan: &mut SecureChannel<S>,
         guard: &mut ReplayGuard,
+        peer_id: DeviceId,
         peer_name: &str,
         recvs: &mut HashMap<u64, RecvTransfer>,
         msg: WireMessage,
@@ -845,6 +953,31 @@ impl Shared {
                 self.apply_revocation(device);
                 Ok(false)
             }
+            // HIST-4: a trusted, live peer starred/unstarred content by hash.
+            // Apply it to our local history (idempotent) and — crucially — do
+            // NOT re-broadcast, so stars never loop around the group.
+            WireMessage::Star {
+                content_hash,
+                starred,
+                ts_ms: _,
+            } => {
+                if let Some(history) = self.history.clone() {
+                    tokio::spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            history.set_starred_by_hash(&content_hash, starred)
+                        })
+                        .await;
+                        match res {
+                            Ok(Ok(n)) => {
+                                tracing::debug!(rows = n, starred, "applied remote star (HIST-4)")
+                            }
+                            Ok(Err(e)) => tracing::warn!(error = %e, "failed to apply remote star"),
+                            Err(e) => tracing::warn!(error = %e, "remote-star task panicked"),
+                        }
+                    });
+                }
+                Ok(false)
+            }
             // FILE-6 (receiver): a peer offers a file. Enforce the size policy,
             // then accept into `received_dir` and reply with the FileAccept.
             WireMessage::FileOffer {
@@ -864,6 +997,9 @@ impl Shared {
                         return Ok(false);
                     }
                 }
+                // Capture name/size for the transfer-event surface before the
+                // offer is consumed (SEC-2: name/size only, never contents).
+                let event_name = name.clone();
                 let offer = WireMessage::FileOffer {
                     transfer_id,
                     name,
@@ -876,11 +1012,24 @@ impl Shared {
                         if chan.send(&accept).await.is_err() {
                             return Ok(false);
                         }
+                        // The transfer is under way: announce it (GUI surface).
+                        self.emit_transfer(TransferEvent::RecvStarted {
+                            transfer_id,
+                            name: event_name,
+                            size,
+                            from: peer_id,
+                        });
                         if recv.is_complete() {
                             // 0-chunk (empty) file: finalize immediately.
                             match recv.finish().await {
                                 Ok(path) => self.deliver_received(chan, transfer_id, path).await,
                                 Err(e) => {
+                                    self.emit_transfer(TransferEvent::RecvCompleted {
+                                        transfer_id,
+                                        path: PathBuf::new(),
+                                        ok: false,
+                                        detail: e.to_string(),
+                                    });
                                     let _ = chan
                                         .send(&WireMessage::FileDone {
                                             transfer_id,
@@ -915,13 +1064,32 @@ impl Shared {
             } => {
                 if let Some(recv) = recvs.get_mut(&transfer_id) {
                     match recv.on_chunk(index, &data.0).await {
-                        Ok(RecvProgress::InProgress { .. }) => {}
+                        Ok(RecvProgress::InProgress { received, total }) => {
+                            // Throttle progress to ~every 5% or every 16 chunks
+                            // (both stateless from received/total).
+                            let cross_5pct = total > 0
+                                && received.saturating_mul(20) / total
+                                    != received.saturating_sub(1).saturating_mul(20) / total;
+                            if received % 16 == 0 || cross_5pct {
+                                self.emit_transfer(TransferEvent::RecvProgress {
+                                    transfer_id,
+                                    received,
+                                    total,
+                                });
+                            }
+                        }
                         Ok(RecvProgress::Completed { path }) => {
                             recvs.remove(&transfer_id);
                             self.deliver_received(chan, transfer_id, path).await;
                         }
                         Err(e) => {
                             recvs.remove(&transfer_id);
+                            self.emit_transfer(TransferEvent::RecvCompleted {
+                                transfer_id,
+                                path: PathBuf::new(),
+                                ok: false,
+                                detail: e.to_string(),
+                            });
                             let _ = chan
                                 .send(&WireMessage::FileDone {
                                     transfer_id,
@@ -1009,9 +1177,21 @@ impl Shared {
             .await;
         tracing::info!(transfer_id, path = %path.display(), "file received");
         let abs = tokio::fs::canonicalize(&path).await.unwrap_or(path);
+        self.emit_transfer(TransferEvent::RecvCompleted {
+            transfer_id,
+            path: abs.clone(),
+            ok: true,
+            detail: String::new(),
+        });
         if let Err(e) = self.writer.write_files(vec![abs]).await {
             tracing::warn!(error = %e, "failed to write received-file reference to clipboard");
         }
+    }
+
+    /// Best-effort broadcast of a transfer event to GUI subscribers. A send with
+    /// no subscribers (or a lagging one) is silently dropped — these are advisory.
+    fn emit_transfer(&self, event: TransferEvent) {
+        let _ = self.transfers.send(event);
     }
 
     /// Route a file-transfer reply to the send-pump task awaiting it (FILE-4).
@@ -1168,6 +1348,7 @@ impl Shared {
                     self.peers.lock().unwrap().insert(
                         peer.device_id,
                         Endpoint {
+                            name: peer.name.clone(),
                             addrs: peer.addrs.clone(),
                             port: peer.port,
                         },
@@ -1260,6 +1441,26 @@ impl Shared {
         newly
     }
 
+    /// HIST-4: send a `Star` to every live session. `ts_ms` stamps the local
+    /// clock for observability; receivers apply idempotently and never re-send.
+    fn broadcast_star(&self, content_hash: [u8; 32], starred: bool) {
+        let ts_ms = now_ms();
+        let sinks: Vec<mpsc::Sender<Outbound>> = self
+            .sessions
+            .lock()
+            .unwrap()
+            .values()
+            .map(|e| e.tx.clone())
+            .collect();
+        for tx in sinks {
+            let _ = tx.try_send(Outbound::Star {
+                content_hash,
+                starred,
+                ts_ms,
+            });
+        }
+    }
+
     /// Send a `Revoke` for each tombstoned device to every live session.
     fn broadcast_revocations(&self, tombstones: &[DeviceId]) {
         if tombstones.is_empty() {
@@ -1303,6 +1504,7 @@ async fn send_pump(
     out_tx: mpsc::Sender<Outbound>,
     mut inbound_rx: mpsc::Receiver<WireMessage>,
     progress: Option<mpsc::Sender<SendProgress>>,
+    transfers: broadcast::Sender<TransferEvent>,
     result_tx: oneshot::Sender<SendReport>,
 ) {
     let transfer_id = transfer.transfer_id();
@@ -1367,6 +1569,12 @@ async fn send_pump(
                         })
                         .await;
                 }
+                // Mirror progress onto the GUI transfer surface (byte counts).
+                let _ = transfers.send(TransferEvent::SendProgress {
+                    transfer_id,
+                    sent,
+                    total,
+                });
                 if let Some(pct) = sent.checked_mul(100).and_then(|n| n.checked_div(total)) {
                     if pct >= next_pct {
                         tracing::info!(name = %name, percent = pct, "file transfer progress");
