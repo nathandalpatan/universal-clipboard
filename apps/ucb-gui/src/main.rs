@@ -132,8 +132,15 @@ async fn ipc_config_get() -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn ipc_config_set(auto_file_sync: Option<bool>) -> Result<serde_json::Value, String> {
-    let req = serde_json::json!({ "cmd": "config_set", "auto_file_sync": auto_file_sync });
+async fn ipc_config_set(
+    auto_file_sync: Option<bool>,
+    max_auto_file_bytes: Option<u64>,
+) -> Result<serde_json::Value, String> {
+    let req = serde_json::json!({
+        "cmd": "config_set",
+        "auto_file_sync": auto_file_sync,
+        "max_auto_file_bytes": max_auto_file_bytes,
+    });
     send_request(req.to_string()).await
 }
 
@@ -141,6 +148,12 @@ async fn ipc_config_set(auto_file_sync: Option<bool>) -> Result<serde_json::Valu
 async fn ipc_revoke(prefix: String) -> Result<serde_json::Value, String> {
     let req = serde_json::json!({ "cmd": "revoke", "prefix": prefix });
     send_request(req.to_string()).await
+}
+
+/// Every peer discovery has seen (trusted or not) — the "nearby devices" list.
+#[tauri::command]
+async fn ipc_discovered() -> Result<serde_json::Value, String> {
+    send_request(r#"{"cmd":"discovered"}"#.to_string()).await
 }
 
 // --- pairing (streaming over one persistent connection) --------------------
@@ -212,6 +225,63 @@ async fn pair_start(
     Ok(first)
 }
 
+/// Begin an *outgoing* pairing to a listening peer (the one-click "Pair" on a
+/// nearby device, or "Add by address"). Opens a dedicated connection, sends
+/// `pair_connect`, stashes the write half in [`PairState`] so `pair_confirm`
+/// answers on the same socket, and streams every daemon line (`code`, `result`,
+/// `error`) to the frontend as `pair://event` events. Returns immediately; the
+/// 6-digit code arrives as an event once the handshake completes.
+#[cfg(unix)]
+#[tauri::command]
+async fn pair_connect_start(
+    app: tauri::AppHandle,
+    addr: String,
+    state: tauri::State<'_, PairState>,
+) -> Result<(), String> {
+    let path = socket_path();
+    let stream = UnixStream::connect(&path).await.map_err(|e| {
+        format!(
+            "could not reach the daemon at {} ({e}). Is sync running?",
+            path.display()
+        )
+    })?;
+    let (read_half, mut write_half) = stream.into_split();
+    let req = serde_json::json!({ "cmd": "pair_connect", "addr": addr }).to_string();
+    write_half
+        .write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    write_half.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    write_half.flush().await.map_err(|e| e.to_string())?;
+
+    *state.0.lock().await = Some(write_half);
+
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => {
+                    let _ = app2.emit("pair://event", serde_json::json!({ "type": "closed" }));
+                    break;
+                }
+                Ok(_) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                        let t = v.get("type").and_then(|t| t.as_str()).map(str::to_string);
+                        let _ = app2.emit("pair://event", v);
+                        if matches!(t.as_deref(), Some("result") | Some("error")) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
 /// Answer the pairing in progress with the user's accept/reject decision.
 #[cfg(unix)]
 #[tauri::command]
@@ -259,6 +329,68 @@ async fn pair_confirm(_accept: bool, _state: tauri::State<'_, PairState>) -> Res
 #[tauri::command]
 async fn pair_cancel(_state: tauri::State<'_, PairState>) -> Result<(), String> {
     Ok(())
+}
+#[cfg(not(unix))]
+#[tauri::command]
+async fn pair_connect_start(
+    _app: tauri::AppHandle,
+    _addr: String,
+    _state: tauri::State<'_, PairState>,
+) -> Result<(), String> {
+    Err("pairing IPC is only implemented for unix-socket platforms".into())
+}
+
+// --- transfers (streaming over one persistent connection) ------------------
+
+/// Subscribe to the daemon's live transfer-event stream. Opens a dedicated
+/// connection, sends `transfers_subscribe`, and relays each event line to the
+/// frontend as a `transfer://event`. When the stream ends (daemon gone or socket
+/// dropped) it emits a final `{"type":"stream_closed"}` so the frontend can
+/// reconnect. Returns immediately.
+#[cfg(unix)]
+#[tauri::command]
+async fn transfers_start(app: tauri::AppHandle) -> Result<(), String> {
+    let path = socket_path();
+    let stream = UnixStream::connect(&path).await.map_err(|e| {
+        format!(
+            "could not reach the daemon at {} ({e}). Is sync running?",
+            path.display()
+        )
+    })?;
+    let (read_half, mut write_half) = stream.into_split();
+    write_half
+        .write_all(b"{\"cmd\":\"transfers_subscribe\"}\n")
+        .await
+        .map_err(|e| e.to_string())?;
+    write_half.flush().await.map_err(|e| e.to_string())?;
+
+    tokio::spawn(async move {
+        // Keep the write half alive for the lifetime of the stream.
+        let _write = write_half;
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => {
+                    let _ = app.emit("transfer://event", serde_json::json!({ "type": "stream_closed" }));
+                    break;
+                }
+                Ok(_) => {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) {
+                        let _ = app.emit("transfer://event", v);
+                    }
+                }
+            }
+        }
+    });
+    Ok(())
+}
+
+#[cfg(not(unix))]
+#[tauri::command]
+async fn transfers_start(_app: tauri::AppHandle) -> Result<(), String> {
+    Err("transfer IPC is only implemented for unix-socket platforms".into())
 }
 
 // --- HIST-5/6/7 history-protection commands --------------------------------
@@ -311,9 +443,243 @@ fn is_sensitive(text: String) -> bool {
     sensitive::is_sensitive(&text)
 }
 
+// --- onboarding + managed daemon (first-run "front door") ------------------
+
+/// A `ucb run` child process the GUI started and therefore owns: it is killed
+/// when the GUI quits. `None` when sync runs as a background service (or a
+/// separately-started daemon) that we must not kill.
+#[derive(Default)]
+struct ManagedDaemon(std::sync::Mutex<Option<std::process::Child>>);
+
+/// Locate the `ucb` daemon binary. Search order (documented in the README):
+/// 1. `UCB_BIN` env var (explicit override),
+/// 2. the same directory as this GUI executable (installed side-by-side),
+/// 3. a `target/{release,debug}/ucb` above the executable (dev checkout),
+/// 4. bare `ucb` on `PATH` (last resort).
+fn locate_ucb() -> PathBuf {
+    let bin_name = if cfg!(windows) { "ucb.exe" } else { "ucb" };
+
+    if let Ok(p) = std::env::var("UCB_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let side = dir.join(bin_name);
+            if side.exists() {
+                return side;
+            }
+            // Dev checkout: walk up looking for target/{release,debug}/ucb.
+            let mut cur = Some(dir);
+            while let Some(d) = cur {
+                for profile in ["release", "debug"] {
+                    let cand = d.join("target").join(profile).join(bin_name);
+                    if cand.exists() {
+                        return cand;
+                    }
+                }
+                cur = d.parent();
+            }
+        }
+    }
+    PathBuf::from(bin_name) // resolved via PATH at spawn time
+}
+
+/// The config directory the GUI (and any daemon it spawns) uses, mirroring the
+/// socket-path resolution: `UCB_CONFIG_DIR`, else the parent of `UCB_SOCKET`,
+/// else the platform config dir.
+fn config_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("UCB_CONFIG_DIR") {
+        return Some(PathBuf::from(dir));
+    }
+    if let Ok(sock) = std::env::var("UCB_SOCKET") {
+        return PathBuf::from(sock).parent().map(|p| p.to_path_buf());
+    }
+    directories::ProjectDirs::from("dev", "ucb", "universal-clipboard")
+        .map(|d| d.config_dir().to_path_buf())
+}
+
+/// Build a `ucb` command, forwarding `--config-dir` when the GUI is pointed at a
+/// non-default config dir (e.g. a sandbox), so spawned daemons share the state.
+fn ucb_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new(locate_ucb());
+    if let Ok(dir) = std::env::var("UCB_CONFIG_DIR") {
+        cmd.args(["--config-dir", &dir]);
+    }
+    cmd
+}
+
+/// Spawn `ucb run` as a managed child (killed on GUI quit). A no-op if we
+/// already manage a running child.
+fn start_managed(managed: &ManagedDaemon) -> Result<(), String> {
+    let mut guard = managed.0.lock().map_err(|_| "managed-daemon lock poisoned")?;
+    if guard.is_some() {
+        return Ok(()); // already running one we own
+    }
+    let child = ucb_command()
+        .arg("run")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| format!("could not start `ucb run`: {e}"))?;
+    *guard = Some(child);
+    Ok(())
+}
+
+/// Kill the managed `ucb run` child if we own one.
+fn stop_managed(managed: &ManagedDaemon) {
+    if let Ok(mut guard) = managed.0.lock() {
+        if let Some(mut child) = guard.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// Report where the `ucb` binary resolves to (for the onboarding UI / diagnostics).
+#[tauri::command]
+fn ucb_binary_path() -> String {
+    locate_ucb().to_string_lossy().into_owned()
+}
+
+/// True if this device has been initialized (`config.json` exists).
+#[tauri::command]
+fn ucb_is_initialized() -> bool {
+    config_dir()
+        .map(|d| d.join("config.json").exists())
+        .unwrap_or(false)
+}
+
+/// True if the GUI currently manages a running `ucb run` child.
+#[tauri::command]
+fn daemon_is_managed(managed: tauri::State<'_, ManagedDaemon>) -> bool {
+    managed
+        .0
+        .lock()
+        .map(|g| g.is_some())
+        .unwrap_or(false)
+}
+
+/// First-run setup: initialize the device if needed, then start syncing.
+///
+/// * Runs `ucb init --name <name> --print-id` when `config.json` is absent,
+///   returning the new identity.
+/// * With `keep_background = true`, installs + activates the background service
+///   (`ucb service install --activate`) so sync survives the GUI closing.
+/// * Otherwise spawns a managed `ucb run` child that is killed when the GUI quits.
+#[tauri::command]
+async fn onboard(
+    name: Option<String>,
+    keep_background: bool,
+    managed: tauri::State<'_, ManagedDaemon>,
+) -> Result<serde_json::Value, String> {
+    let cfg_dir = config_dir().ok_or("could not determine the config directory")?;
+
+    let mut identity = serde_json::Value::Null;
+    if !cfg_dir.join("config.json").exists() {
+        let mut cmd = ucb_command();
+        cmd.args(["init", "--print-id"]);
+        if let Some(n) = name.as_deref().filter(|s| !s.trim().is_empty()) {
+            cmd.args(["--name", n]);
+        }
+        let out = cmd
+            .output()
+            .map_err(|e| format!("could not run `ucb init`: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "`ucb init` failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        identity = serde_json::from_slice(&out.stdout).unwrap_or(serde_json::Value::Null);
+    }
+
+    let managed_flag = if keep_background {
+        let out = ucb_command()
+            .args(["service", "install", "--activate"])
+            .output()
+            .map_err(|e| format!("could not install the background service: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "installing the background service failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            ));
+        }
+        false
+    } else {
+        start_managed(&managed)?;
+        true
+    };
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "managed": managed_flag,
+        "identity": identity,
+    }))
+}
+
+/// Start syncing under GUI management (the "Start sync" button).
+#[tauri::command]
+async fn daemon_start(managed: tauri::State<'_, ManagedDaemon>) -> Result<(), String> {
+    start_managed(&managed)
+}
+
+/// Stop the GUI-managed daemon (the "Stop sync" button). No-op if sync runs as a
+/// background service we do not own.
+#[tauri::command]
+async fn daemon_stop(managed: tauri::State<'_, ManagedDaemon>) -> Result<(), String> {
+    stop_managed(&managed);
+    Ok(())
+}
+
+/// Restart the GUI-managed daemon (the Settings "Restart sync" action, used to
+/// apply config changes that need a fresh `ucb run`). Only meaningful when the
+/// daemon is GUI-managed.
+#[tauri::command]
+async fn daemon_restart(managed: tauri::State<'_, ManagedDaemon>) -> Result<(), String> {
+    stop_managed(&managed);
+    // Give the OS a moment to release the socket/port before re-binding.
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+    start_managed(&managed)
+}
+
+/// Reveal a received file in the platform file manager ("Show in folder").
+#[tauri::command]
+async fn reveal_in_folder(path: String) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .args(["-R", &path])
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{path}"))
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let parent = std::path::Path::new(&path)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        std::process::Command::new("xdg-open")
+            .arg(parent)
+            .spawn()
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 fn main() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(PairState::default())
+        .manage(ManagedDaemon::default())
         .setup(|app| {
             // Tray menu: Open, a status line (UX-2 sync indicator via polling),
             // and Quit.
@@ -392,15 +758,37 @@ fn main() {
             ipc_config_get,
             ipc_config_set,
             ipc_revoke,
+            ipc_discovered,
             pair_start,
             pair_confirm,
             pair_cancel,
+            pair_connect_start,
+            transfers_start,
             platform_capabilities,
             set_capture_protection,
             authenticate,
             is_sensitive_batch,
             is_sensitive,
+            ucb_binary_path,
+            ucb_is_initialized,
+            daemon_is_managed,
+            onboard,
+            daemon_start,
+            daemon_stop,
+            daemon_restart,
+            reveal_in_folder,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the Universal Clipboard GUI");
+        .build(tauri::generate_context!())
+        .expect("error while building the Universal Clipboard GUI");
+
+    // Kill a GUI-managed `ucb run` child when the app exits, so closing the
+    // window never leaves an orphaned daemon we started. A background-service
+    // daemon is not owned by us and is left running.
+    app.run(|handle, event| {
+        if let tauri::RunEvent::Exit = event {
+            if let Some(managed) = handle.try_state::<ManagedDaemon>() {
+                stop_managed(&managed);
+            }
+        }
+    });
 }

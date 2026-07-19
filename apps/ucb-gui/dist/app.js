@@ -42,6 +42,40 @@ function fmtTime(ms) {
   }
 }
 
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n < 10 && i > 0 ? n.toFixed(1) : Math.round(n)} ${units[i]}`;
+}
+
+// --- toasts (UX-4) ---------------------------------------------------------
+
+// Show a transient toast. `actions` is an array of { label, onClick }.
+function toast(msg, kind = "ok", actions = [], timeout = 6000) {
+  const box = el("div", `toast ${kind}`);
+  box.appendChild(el("span", "toast-msg", msg));
+  const dismiss = () => {
+    if (box.parentNode) box.parentNode.removeChild(box);
+  };
+  for (const a of actions) {
+    const b = el("button", "btn small", a.label);
+    b.addEventListener("click", () => {
+      try {
+        a.onClick();
+      } catch {}
+      dismiss();
+    });
+    box.appendChild(b);
+  }
+  $("#toasts").appendChild(box);
+  if (timeout) setTimeout(dismiss, timeout);
+}
+
 // --- platform capabilities (HIST-5/6/7) ------------------------------------
 
 // Populated at boot from the `platform_capabilities` command. Sensible defaults
@@ -74,12 +108,193 @@ function showView(name) {
   );
   if (name === "history") enterHistory();
   if (name === "devices") refreshDevices();
-  if (name === "settings") renderSettings();
+  if (name === "settings") {
+    renderSettings();
+    loadConfigIntoSettings();
+  }
 }
 
 document.querySelectorAll(".tab").forEach((t) =>
   t.addEventListener("click", () => showView(t.dataset.view))
 );
+
+// --- daemon reachability + managed sync control ----------------------------
+
+let daemonUp = false;
+let daemonManaged = false;
+
+function setDaemonDot(on) {
+  const dot = $("#daemon-dot");
+  dot.classList.toggle("on", on);
+  dot.classList.toggle("off", !on);
+}
+
+// Refresh the header sync label + Start/Stop button from the current state.
+async function refreshSyncControl(status) {
+  daemonUp = !!status;
+  setDaemonDot(daemonUp);
+
+  const label = $("#sync-label");
+  const btn = $("#sync-toggle");
+
+  if (daemonUp) {
+    try {
+      daemonManaged = await invoke("daemon_is_managed");
+    } catch {
+      daemonManaged = false;
+    }
+    const peers = (status.peers || []).length;
+    const connected = (status.peers || []).filter((p) => p.connected).length;
+    label.textContent = `Sync on · ${connected}/${peers} connected`;
+    if (daemonManaged) {
+      btn.hidden = false;
+      btn.textContent = "Stop sync";
+    } else {
+      btn.hidden = true; // an external / background daemon — not ours to stop
+    }
+  } else {
+    daemonManaged = false;
+    label.textContent = "Sync off";
+    btn.hidden = false;
+    btn.textContent = "Start sync";
+  }
+}
+
+$("#sync-toggle").addEventListener("click", async () => {
+  if (daemonUp && daemonManaged) {
+    try {
+      await invoke("daemon_stop");
+    } catch (e) {
+      toast(String(e), "err");
+    }
+    setTimeout(pollStatus, 300);
+  } else if (!daemonUp) {
+    // Route through onboarding if the device isn't set up yet.
+    let inited = false;
+    try {
+      inited = await invoke("ucb_is_initialized");
+    } catch {}
+    if (!inited) {
+      openOnboard();
+      return;
+    }
+    try {
+      await invoke("daemon_start");
+      toast("Starting sync…");
+    } catch (e) {
+      toast(String(e), "err");
+    }
+    waitForDaemon();
+  }
+});
+
+// Poll the daemon status; drives the header, dot, and (implicitly) onboarding.
+async function pollStatus() {
+  let status = null;
+  try {
+    status = await invoke("ipc_status");
+  } catch {
+    status = null;
+  }
+  await refreshSyncControl(status);
+  if (!status) {
+    maybeShowOnboard();
+  } else {
+    hideOnboard();
+    ensureTransfersStream();
+    detectSyncedAway(status);
+  }
+  return status;
+}
+
+// After a start/onboarding, poll until the daemon socket comes up (or give up).
+function waitForDaemon() {
+  let tries = 0;
+  const iv = setInterval(async () => {
+    tries++;
+    const status = await pollStatus();
+    if (status || tries > 20) {
+      clearInterval(iv);
+      if (status) refreshDevices();
+    }
+  }, 500);
+}
+
+// --- onboarding wizard (first-run "front door") ----------------------------
+
+let onboardVisible = false;
+
+function maybeShowOnboard() {
+  // Only surface onboarding when the daemon is unreachable.
+  if (daemonUp) return;
+  openOnboard();
+}
+
+async function openOnboard() {
+  if (onboardVisible) return;
+  onboardVisible = true;
+  $("#onboard").hidden = false;
+  $("#onboard-msg").hidden = true;
+
+  try {
+    $("#onboard-bin").textContent = await invoke("ucb_binary_path");
+  } catch {
+    $("#onboard-bin").textContent = "ucb (not found on PATH)";
+  }
+
+  let inited = false;
+  try {
+    inited = await invoke("ucb_is_initialized");
+  } catch {}
+  $("#onboard-setup").hidden = inited;
+  $("#onboard-start").hidden = !inited;
+  $("#onboard-title").textContent = inited
+    ? "Sync isn't running"
+    : "Welcome to Universal Clipboard";
+}
+
+function hideOnboard() {
+  if (!onboardVisible) return;
+  onboardVisible = false;
+  $("#onboard").hidden = true;
+}
+
+$("#onboard-go").addEventListener("click", async () => {
+  const name = $("#onboard-name").value.trim() || null;
+  const keepBackground = $("#onboard-keepbg").checked;
+  const msg = $("#onboard-msg");
+  msg.hidden = true;
+  $("#onboard-go").disabled = true;
+  try {
+    const res = await invoke("onboard", { name, keepBackground });
+    const id = res && res.identity && res.identity.id;
+    toast(id ? `This device is ready (${String(id).slice(0, 8)})` : "This device is ready");
+    waitForDaemon();
+  } catch (e) {
+    msg.hidden = false;
+    msg.classList.add("err");
+    msg.textContent = String(e);
+  } finally {
+    $("#onboard-go").disabled = false;
+  }
+});
+
+$("#onboard-startbtn").addEventListener("click", async () => {
+  const msg = $("#onboard-msg");
+  msg.hidden = true;
+  $("#onboard-startbtn").disabled = true;
+  try {
+    await invoke("daemon_start");
+    toast("Starting sync…");
+    waitForDaemon();
+  } catch (e) {
+    msg.hidden = false;
+    msg.classList.add("err");
+    msg.textContent = String(e);
+  } finally {
+    $("#onboard-startbtn").disabled = false;
+  }
+});
 
 // --- Devices (UX-2) --------------------------------------------------------
 
@@ -87,53 +302,98 @@ let lastPeers = [];
 
 async function refreshDevices() {
   const body = $("#devices-body");
+  const nearby = $("#nearby-body");
   let status;
   try {
     status = await withSpinner($("#devices-spin"), () => invoke("ipc_status"));
   } catch (e) {
-    // No daemon socket / unreachable → clear empty state.
-    setDaemonDot(false);
+    // No daemon socket / unreachable → onboarding takes over; clear the lists.
     body.innerHTML = "";
+    nearby.innerHTML = "";
     const box = el("div", "empty");
-    box.appendChild(el("h2", null, "Daemon not running"));
-    const p = el("p", "muted");
-    p.innerHTML = 'Start the engine first: run <code>ucb run</code> in a terminal.';
-    box.appendChild(p);
+    box.appendChild(el("h2", null, "Sync isn't running"));
+    box.appendChild(el("p", "muted", "Start sync from the header, or set up this device."));
+    const cta = el("button", "btn primary", "Set up / start");
+    cta.addEventListener("click", openOnboard);
+    box.appendChild(cta);
     body.appendChild(box);
     lastPeers = [];
     updateDeviceFilter();
     return;
   }
 
-  setDaemonDot(true);
   const peers = (status && status.peers) || [];
   lastPeers = peers;
   updateDeviceFilter();
-  body.innerHTML = "";
 
+  // Paired devices.
+  body.innerHTML = "";
   if (peers.length === 0) {
     const box = el("div", "empty");
-    box.appendChild(el("h2", null, "No devices paired"));
-    box.appendChild(el("p", "muted", "Pair another device to start syncing your clipboard."));
-    const cta = el("button", "btn primary", "Pair a device");
-    cta.addEventListener("click", () => showView("pair"));
-    box.appendChild(cta);
+    box.appendChild(el("h2", null, "No devices paired yet"));
+    box.appendChild(
+      el("p", "muted", "On your other computer, install ucb and click Pair — or use “Show pairing code” above.")
+    );
     body.appendChild(box);
+  } else {
+    for (const p of peers) {
+      const row = el("div", "rowitem");
+      const badge = el(
+        "span",
+        `badge ${p.connected ? "on" : "off"}`,
+        p.connected ? "connected" : "offline"
+      );
+      row.appendChild(badge);
+      const grow = el("div", "grow");
+      grow.appendChild(el("div", "name", p.name || "(unnamed)"));
+      grow.appendChild(el("div", "sub", p.id_short));
+      row.appendChild(grow);
+      const revoke = el("button", "btn small danger", "Revoke");
+      revoke.addEventListener("click", () => revokePeer(p.id_short, p.name));
+      row.appendChild(revoke);
+      body.appendChild(row);
+    }
+  }
+
+  await refreshNearby();
+}
+
+// Nearby devices: discovered but not yet paired.
+async function refreshNearby() {
+  const nearby = $("#nearby-body");
+  let discovered = [];
+  try {
+    const res = await invoke("ipc_discovered");
+    discovered = (res && res.peers) || [];
+  } catch {
+    discovered = [];
+  }
+
+  const unpaired = discovered.filter((p) => !p.trusted);
+  nearby.innerHTML = "";
+  if (unpaired.length === 0) {
+    const box = el("div", "empty");
+    box.appendChild(el("p", "muted", "No unpaired devices seen on your network yet."));
+    nearby.appendChild(box);
     return;
   }
 
-  for (const p of peers) {
+  for (const p of unpaired) {
     const row = el("div", "rowitem");
-    const badge = el("span", `badge ${p.connected ? "on" : "off"}`, p.connected ? "connected" : "offline");
-    row.appendChild(badge);
     const grow = el("div", "grow");
     grow.appendChild(el("div", "name", p.name || "(unnamed)"));
-    grow.appendChild(el("div", "sub", p.id_short));
+    const ip = (p.addrs && p.addrs[0]) || "?";
+    grow.appendChild(el("div", "sub", `${ip} · ${p.id_short}`));
     row.appendChild(grow);
-    const revoke = el("button", "btn small danger", "Revoke");
-    revoke.addEventListener("click", () => revokePeer(p.id_short, p.name));
-    row.appendChild(revoke);
-    body.appendChild(row);
+    const btn = el("button", "btn small primary", "Pair");
+    btn.addEventListener("click", () => {
+      // Dial the peer's *pairing* port (advertised sync port + 1). The peer must
+      // be showing its pairing code ("Show pairing code") for this to connect.
+      const pairPort = Number(p.port) + 1;
+      startConnectPairing(`${ip}:${pairPort}`, p.name || ip);
+    });
+    row.appendChild(btn);
+    nearby.appendChild(row);
   }
 }
 
@@ -143,23 +403,51 @@ async function revokePeer(prefix, name) {
   }
   try {
     const res = await invoke("ipc_revoke", { prefix });
-    if (!res.ok) alert(res.detail || "Revoke failed.");
+    if (!res.ok) toast(res.detail || "Revoke failed.", "err");
+    else toast(`Revoked ${name || prefix}`);
   } catch (e) {
-    alert(String(e));
+    toast(String(e), "err");
   }
   refreshDevices();
 }
 
-function setDaemonDot(on) {
-  const dot = $("#daemon-dot");
-  dot.classList.toggle("on", on);
-  dot.classList.toggle("off", !on);
+// Devices actions row.
+$("#pair-show-code").addEventListener("click", startListenPairing);
+$("#addr-pair").addEventListener("click", () => {
+  const addr = $("#addr-input").value.trim();
+  if (addr) startConnectPairing(addr, addr);
+});
+$("#addr-input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    const addr = e.target.value.trim();
+    if (addr) startConnectPairing(addr, addr);
+  }
+});
+
+// --- Pairing modal (PAIR-2) ------------------------------------------------
+
+let pairMode = null; // "listen" | "connect"
+
+function openPairModal() {
+  $("#pair-modal").hidden = false;
+  $("#pair-listen-info").hidden = true;
+  $("#pair-connecting").hidden = true;
+  $("#pair-code-card").hidden = true;
+  $("#pair-result").hidden = true;
+  $("#pair-uri").textContent = "";
+  $("#pair-qr").textContent = "";
+  $("#pair-code").textContent = "";
 }
 
-// --- Pair (PAIR-2) ---------------------------------------------------------
+async function closePairModal() {
+  try {
+    await invoke("pair_cancel");
+  } catch {}
+  pairMode = null;
+  $("#pair-modal").hidden = true;
+}
 
-$("#pair-start").addEventListener("click", startPairing);
-$("#pair-cancel").addEventListener("click", cancelPairing);
+$("#pair-modal-close").addEventListener("click", closePairModal);
 $("#pair-copy").addEventListener("click", () => {
   const uri = $("#pair-uri").textContent;
   if (navigator.clipboard) navigator.clipboard.writeText(uri).catch(() => {});
@@ -167,18 +455,10 @@ $("#pair-copy").addEventListener("click", () => {
 $("#pair-accept").addEventListener("click", () => confirmPairing(true));
 $("#pair-reject").addEventListener("click", () => confirmPairing(false));
 
-function resetPairUI() {
-  $("#pair-idle").hidden = false;
-  $("#pair-live").hidden = true;
-  $("#pair-code-card").hidden = true;
-  $("#pair-result").hidden = true;
-  $("#pair-qr").textContent = "";
-  $("#pair-uri").textContent = "";
-  $("#pair-code").textContent = "";
-}
-
-async function startPairing() {
-  $("#pair-result").hidden = true;
+async function startListenPairing() {
+  pairMode = "listen";
+  openPairModal();
+  $("#pair-modal-title").textContent = "Show pairing code";
   let first;
   try {
     first = await invoke("pair_start");
@@ -190,16 +470,22 @@ async function startPairing() {
     showPairResult(false, first.message || "Could not start pairing.");
     return;
   }
-  $("#pair-idle").hidden = true;
-  $("#pair-live").hidden = false;
-  $("#pair-code-card").hidden = true;
+  $("#pair-listen-info").hidden = false;
   $("#pair-uri").textContent = first.uri || "";
   $("#pair-qr").textContent = first.qr_text || "";
 }
 
-async function cancelPairing() {
-  try { await invoke("pair_cancel"); } catch {}
-  resetPairUI();
+async function startConnectPairing(addr, label) {
+  pairMode = "connect";
+  openPairModal();
+  $("#pair-modal-title").textContent = "Pair a device";
+  $("#pair-connecting").hidden = false;
+  $("#pair-target").textContent = label || addr;
+  try {
+    await invoke("pair_connect_start", { addr });
+  } catch (e) {
+    showPairResult(false, String(e));
+  }
 }
 
 async function confirmPairing(accept) {
@@ -216,31 +502,214 @@ function showPairResult(ok, msg) {
   b.hidden = false;
   b.classList.toggle("err", !ok);
   b.textContent = ok ? `Paired with ${msg}.` : `Pairing failed: ${msg}`;
-  $("#pair-live").hidden = true;
-  $("#pair-idle").hidden = false;
+  $("#pair-listen-info").hidden = true;
+  $("#pair-connecting").hidden = true;
+  $("#pair-code-card").hidden = true;
 }
 
-// Streamed pairing events from the Rust side.
+// Streamed pairing events from the Rust side (both listen + connect flows).
 listen("pair://event", (event) => {
   const v = event.payload || {};
   if (v.type === "code") {
     $("#pair-code").textContent = v.code || "";
     const dev = v.device || {};
     $("#pair-peer").textContent = `${dev.name || "device"} (${(dev.id || "").slice(0, 8)})`;
+    $("#pair-connecting").hidden = true;
     $("#pair-code-card").hidden = false;
   } else if (v.type === "result") {
     if (v.ok) {
       showPairResult(true, v.name || "device");
+      toast(`Paired with ${v.name || "device"} — syncing now`, "ok");
       refreshDevices();
+      setTimeout(() => {
+        if (pairMode) $("#pair-modal").hidden = true;
+      }, 1500);
     } else {
       showPairResult(false, v.message || "declined");
     }
+  } else if (v.type === "error") {
+    showPairResult(false, v.message || "pairing error");
   } else if (v.type === "closed") {
-    // Connection dropped before completion; return to idle unless a result
-    // already rendered.
-    if ($("#pair-result").hidden) resetPairUI();
+    if ($("#pair-result").hidden && !$("#pair-modal").hidden) {
+      showPairResult(false, "connection closed");
+    }
   }
 });
+
+// --- Transfers + progress (UX-3/UX-4) --------------------------------------
+
+const transfers = new Map(); // transfer_id -> state
+let transfersStreamActive = false;
+
+function ensureTransfersStream() {
+  if (transfersStreamActive) return;
+  transfersStreamActive = true;
+  invoke("transfers_start").catch(() => {
+    transfersStreamActive = false;
+  });
+}
+
+function renderTransfers() {
+  const panel = $("#transfers");
+  panel.innerHTML = "";
+  const visible = [...transfers.values()].filter((t) => t.visible);
+  panel.hidden = visible.length === 0;
+  for (const t of visible) {
+    const box = el("div", "xfer");
+    const head = el("div", "xfer-head");
+    head.appendChild(el("span", "xfer-name", `${t.dir === "recv" ? "↓" : "↑"} ${t.name}`));
+    const pct = t.total ? Math.min(100, Math.round((t.done / t.total) * 100)) : 0;
+    const meta = t.speed ? `${pct}% · ${fmtBytes(t.speed)}/s` : `${pct}%`;
+    head.appendChild(el("span", "xfer-meta", meta));
+    box.appendChild(head);
+    const bar = el("div", "bar");
+    const fill = el("i");
+    fill.style.width = `${pct}%`;
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    panel.appendChild(box);
+  }
+}
+
+// Update rolling-window speed from chunk fraction * known size.
+function updateSpeed(t) {
+  const now = Date.now();
+  if (t.sizeBytes && t.total) {
+    const bytes = (t.done / t.total) * t.sizeBytes;
+    if (t.lastTime) {
+      const dt = (now - t.lastTime) / 1000;
+      if (dt > 0.05) {
+        const inst = (bytes - t.lastBytes) / dt;
+        t.speed = t.speed ? t.speed * 0.6 + inst * 0.4 : inst; // smoothed
+        t.lastBytes = bytes;
+        t.lastTime = now;
+      }
+    } else {
+      t.lastBytes = bytes;
+      t.lastTime = now;
+    }
+  }
+}
+
+// Reveal a transfer's progress bar only if it is still active past 350ms.
+function scheduleVisible(id) {
+  setTimeout(() => {
+    const t = transfers.get(id);
+    if (t) {
+      t.visible = true;
+      renderTransfers();
+    }
+  }, 350);
+}
+
+listen("transfer://event", (event) => {
+  const v = event.payload || {};
+  const id = v.transfer_id;
+  switch (v.type) {
+    case "recv_started": {
+      transfers.set(id, {
+        dir: "recv",
+        name: v.name || "file",
+        sizeBytes: Number(v.size) || 0,
+        total: 0,
+        done: 0,
+        visible: false,
+        speed: 0,
+      });
+      scheduleVisible(id);
+      break;
+    }
+    case "recv_progress": {
+      const t = transfers.get(id) || { dir: "recv", name: "file", visible: false, speed: 0 };
+      t.total = Number(v.total) || t.total;
+      t.done = Number(v.received) || t.done;
+      updateSpeed(t);
+      transfers.set(id, t);
+      renderTransfers();
+      break;
+    }
+    case "recv_completed": {
+      const t = transfers.get(id);
+      const name = (t && t.name) || "file";
+      transfers.delete(id);
+      renderTransfers();
+      if (v.ok) {
+        const path = v.path || "";
+        toast(
+          `Received ${name}`,
+          "ok",
+          path ? [{ label: "Show in folder", onClick: () => invoke("reveal_in_folder", { path }) }] : []
+        );
+      } else {
+        toast(`Failed to receive ${name}: ${v.detail || ""}`, "err");
+      }
+      break;
+    }
+    case "send_progress": {
+      const existed = transfers.has(id);
+      const t = transfers.get(id) || { dir: "send", name: "Sending file…", visible: false, speed: 0 };
+      t.total = Number(v.total) || t.total;
+      t.done = Number(v.sent) || t.done;
+      transfers.set(id, t);
+      if (!existed) scheduleVisible(id);
+      renderTransfers();
+      break;
+    }
+    case "send_completed": {
+      const t = transfers.get(id);
+      const name = v.name || (t && t.name) || "file";
+      transfers.delete(id);
+      renderTransfers();
+      if (v.ok) toast(`Sent ${name}`, "ok");
+      else toast(`Failed to send ${name}: ${v.detail || ""}`, "err");
+      break;
+    }
+    case "stream_closed": {
+      transfers.clear();
+      renderTransfers();
+      transfersStreamActive = false;
+      // Reconnect shortly if the daemon is still up.
+      setTimeout(() => {
+        if (daemonUp) ensureTransfersStream();
+      }, 1500);
+      break;
+    }
+  }
+});
+
+// --- "synced while away" detection (UX-4) ----------------------------------
+
+let prevConnected = new Set();
+
+function detectSyncedAway(status) {
+  const now = Date.now();
+  const nowConnected = new Set(
+    (status.peers || []).filter((p) => p.connected).map((p) => p.id_short)
+  );
+  for (const id of nowConnected) {
+    if (!prevConnected.has(id)) {
+      // Peer just connected — check for a burst of arriving clips over ~5s.
+      const at = now;
+      setTimeout(() => checkSyncedAway(id, at), 5000);
+    }
+  }
+  prevConnected = nowConnected;
+}
+
+async function checkSyncedAway(idShort, sinceTs) {
+  try {
+    const res = await invoke("ipc_history_list", { limit: 20 });
+    const entries = (res && res.entries) || [];
+    const fresh = entries.filter((e) => Number(e.ts_ms) >= sinceTs);
+    if (fresh.length > 3) {
+      const peer = lastPeers.find((p) => p.id_short === idShort);
+      const who = (peer && peer.name) || idShort;
+      toast(`Synced ${fresh.length} clips from ${who} while you were away`, "ok");
+    }
+  } catch {
+    /* best-effort */
+  }
+}
 
 // --- History gate (HIST-5) -------------------------------------------------
 
@@ -364,10 +833,8 @@ async function loadHistory(reset) {
   } catch (e) {
     body.innerHTML = "";
     const box = el("div", "empty");
-    box.appendChild(el("h2", null, "Daemon not running"));
-    const p = el("p", "muted");
-    p.innerHTML = 'History lives in the daemon. Run <code>ucb run</code> first.';
-    box.appendChild(p);
+    box.appendChild(el("h2", null, "Sync isn't running"));
+    box.appendChild(el("p", "muted", "History lives in the daemon. Start sync first."));
     body.appendChild(box);
     $("#hist-more").hidden = true;
     return;
@@ -449,7 +916,7 @@ function renderEntry(e) {
     try {
       await invoke("ipc_history_star", { id: e.id, starred: !e.starred });
       loadHistory(true);
-    } catch (err) { alert(String(err)); }
+    } catch (err) { toast(String(err), "err"); }
   });
   row.appendChild(star);
 
@@ -479,7 +946,7 @@ function renderEntry(e) {
     try {
       await invoke("ipc_history_delete", { id: e.id });
       loadHistory(true);
-    } catch (err) { alert(String(err)); }
+    } catch (err) { toast(String(err), "err"); }
   });
   row.appendChild(del);
 
@@ -488,7 +955,9 @@ function renderEntry(e) {
   return { row, contentEl, text };
 }
 
-// --- Settings (HIST-7 capture toggle + HIST-5 note) ------------------------
+// --- Settings (auto-file-sync + max file + capture + history-lock) ---------
+
+const MIB = 1024 * 1024;
 
 // Apply the persisted screenshot-protection preference (default ON) on boot.
 async function applyCaptureFromStorage() {
@@ -511,8 +980,69 @@ $("#set-capture").addEventListener("change", async (ev) => {
     try {
       await invoke("set_capture_protection", { enabled });
     } catch (e) {
-      alert(String(e));
+      toast(String(e), "err");
     }
+  }
+});
+
+// Load current daemon config into the Settings controls.
+async function loadConfigIntoSettings() {
+  let cfg;
+  try {
+    cfg = await invoke("ipc_config_get");
+  } catch {
+    return; // daemon down; onboarding handles it
+  }
+  if (cfg && typeof cfg === "object") {
+    $("#set-autofile").checked = !!cfg.auto_file_sync;
+    if (cfg.max_auto_file_bytes != null) {
+      $("#set-maxfile").value = Math.max(1, Math.round(Number(cfg.max_auto_file_bytes) / MIB));
+    }
+  }
+}
+
+function showRestartBanner() {
+  const banner = $("#restart-banner");
+  banner.hidden = false;
+  const btn = $("#restart-sync");
+  // The one-click restart only works for a GUI-managed daemon.
+  btn.hidden = !daemonManaged;
+  if (!daemonManaged) {
+    $("#restart-msg").textContent =
+      "A setting changed. Restart the daemon (e.g. `ucb run`) to apply it.";
+  } else {
+    $("#restart-msg").textContent = "A setting changed. Restart sync to apply it.";
+  }
+}
+
+$("#set-autofile").addEventListener("change", async (ev) => {
+  try {
+    await invoke("ipc_config_set", { autoFileSync: ev.target.checked, maxAutoFileBytes: null });
+    showRestartBanner();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+});
+
+$("#set-maxfile-save").addEventListener("click", async () => {
+  const mib = Math.max(1, Math.round(Number($("#set-maxfile").value) || 0));
+  try {
+    await invoke("ipc_config_set", { autoFileSync: null, maxAutoFileBytes: mib * MIB });
+    toast(`Max file size set to ${mib} MiB`);
+    showRestartBanner();
+  } catch (e) {
+    toast(String(e), "err");
+  }
+});
+
+$("#restart-sync").addEventListener("click", async () => {
+  try {
+    await invoke("daemon_restart");
+    $("#restart-banner").hidden = true;
+    toast("Restarting sync…");
+    waitForDaemon();
+  } catch (e) {
+    toast(String(e), "err");
   }
 });
 
@@ -538,8 +1068,9 @@ function renderSettings() {
 // --- boot ------------------------------------------------------------------
 
 initCapabilities();
-refreshDevices();
+pollStatus().then(() => refreshDevices());
+
 setInterval(() => {
-  // Poll devices only while its view is active (every 2s per UX-2).
+  pollStatus();
   if ($("#view-devices").classList.contains("is-active")) refreshDevices();
-}, 2000);
+}, 3000);

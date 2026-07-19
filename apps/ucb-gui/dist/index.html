@@ -12,9 +12,12 @@
         <span class="dot" id="daemon-dot" title="daemon status"></span>
         <strong>Universal Clipboard</strong>
       </div>
+      <div class="sync-control">
+        <span class="sync-label" id="sync-label">Checking…</span>
+        <button class="btn small" id="sync-toggle" hidden>Start sync</button>
+      </div>
       <nav class="tabs">
         <button class="tab is-active" data-view="devices">Devices</button>
-        <button class="tab" data-view="pair">Pair</button>
         <button class="tab" data-view="history">History</button>
         <button class="tab" data-view="settings">Settings</button>
       </nav>
@@ -27,47 +30,20 @@
           <h1>Devices</h1>
           <span class="spinner" id="devices-spin"></span>
         </div>
+
+        <div class="actions-row">
+          <button class="btn primary" id="pair-show-code">Show pairing code</button>
+          <div class="addr-add">
+            <input type="text" id="addr-input" placeholder="ip:port or ucb://ip:port" />
+            <button class="btn small" id="addr-pair">Add by address</button>
+          </div>
+        </div>
+
+        <h2 class="section-title">Paired devices</h2>
         <div id="devices-body"></div>
-      </section>
 
-      <!-- Pair -->
-      <section id="view-pair" class="view">
-        <div class="view-head"><h1>Pair a device</h1></div>
-        <div id="pair-idle">
-          <p class="muted">
-            Start a pairing session, then run
-            <code>ucb pair --connect &lt;address&gt;</code> on the other device
-            (or scan the QR). Confirm the 6-digit code matches on both screens.
-          </p>
-          <button class="btn primary" id="pair-start">Start pairing</button>
-        </div>
-
-        <div id="pair-live" hidden>
-          <div class="card">
-            <h2>Waiting for a device…</h2>
-            <label class="fieldlabel">Pairing address</label>
-            <div class="uri-row">
-              <code id="pair-uri"></code>
-              <button class="btn small" id="pair-copy">Copy</button>
-            </div>
-            <pre id="pair-qr" class="qr"></pre>
-          </div>
-
-          <div class="card" id="pair-code-card" hidden>
-            <h2>Confirm the code</h2>
-            <p class="muted">Make sure this matches the code on
-              <strong id="pair-peer">the other device</strong>:</p>
-            <div class="code" id="pair-code"></div>
-            <div class="row">
-              <button class="btn primary" id="pair-accept">Codes match — pair</button>
-              <button class="btn danger" id="pair-reject">Reject</button>
-            </div>
-          </div>
-
-          <button class="btn small ghost" id="pair-cancel">Cancel</button>
-        </div>
-
-        <div id="pair-result" class="banner" hidden></div>
+        <h2 class="section-title">Nearby devices</h2>
+        <div id="nearby-body"></div>
       </section>
 
       <!-- History -->
@@ -104,6 +80,29 @@
       <section id="view-settings" class="view">
         <div class="view-head"><h1>Settings</h1></div>
 
+        <div class="banner warn" id="restart-banner" hidden>
+          <span id="restart-msg">A setting changed. Restart sync to apply it.</span>
+          <button class="btn small" id="restart-sync">Restart sync</button>
+        </div>
+
+        <div class="card">
+          <label class="toggle-row">
+            <input type="checkbox" id="set-autofile" />
+            <span>
+              <strong>Automatically sync copied files</strong>
+              <span class="muted toggle-sub">
+                When on, files you copy are offered to your paired devices, and
+                incoming files are saved automatically. Off by default.
+              </span>
+            </span>
+          </label>
+          <div class="field-inline">
+            <label for="set-maxfile">Max file size (MiB)</label>
+            <input type="number" id="set-maxfile" min="1" step="1" />
+            <button class="btn small" id="set-maxfile-save">Save</button>
+          </div>
+        </div>
+
         <div class="card">
           <label class="toggle-row">
             <input type="checkbox" id="set-capture" checked />
@@ -125,6 +124,80 @@
         </div>
       </section>
     </main>
+
+    <!-- Pairing modal (shared by "Show pairing code", nearby Pair, add-by-address) -->
+    <div id="pair-modal" class="modal-backdrop" hidden>
+      <div class="modal">
+        <button class="modal-close" id="pair-modal-close" title="Close">✕</button>
+        <h2 id="pair-modal-title">Pair a device</h2>
+
+        <div id="pair-listen-info" hidden>
+          <p class="muted">
+            On your other computer, install <code>ucb</code> and either scan this
+            QR or run <code>ucb pair --connect &lt;address&gt;</code>. Confirm the
+            6-digit code matches on both screens.
+          </p>
+          <label class="fieldlabel">Pairing address</label>
+          <div class="uri-row">
+            <code id="pair-uri"></code>
+            <button class="btn small" id="pair-copy">Copy</button>
+          </div>
+          <pre id="pair-qr" class="qr"></pre>
+        </div>
+
+        <div id="pair-connecting" hidden>
+          <p class="muted"><span class="spinner show inline"></span> Connecting to <span id="pair-target"></span>…</p>
+        </div>
+
+        <div id="pair-code-card" hidden>
+          <p class="muted">Make sure this matches the code on
+            <strong id="pair-peer">the other device</strong>:</p>
+          <div class="code" id="pair-code"></div>
+          <div class="row">
+            <button class="btn primary" id="pair-accept">Codes match — pair</button>
+            <button class="btn danger" id="pair-reject">Reject</button>
+          </div>
+        </div>
+
+        <div id="pair-result" class="banner" hidden></div>
+      </div>
+    </div>
+
+    <!-- Onboarding overlay (first run / daemon down) -->
+    <div id="onboard" class="onboard-backdrop" hidden>
+      <div class="onboard-card">
+        <div class="onboard-glyph">📋</div>
+        <h1 id="onboard-title">Welcome to Universal Clipboard</h1>
+        <p class="muted" id="onboard-lead">
+          Sync your clipboard across your own devices over the local network,
+          end-to-end encrypted. Let's get this device set up.
+        </p>
+
+        <div id="onboard-setup">
+          <label class="fieldlabel" for="onboard-name">Device name</label>
+          <input type="text" id="onboard-name" placeholder="e.g. Work Laptop" />
+          <label class="check onboard-bg">
+            <input type="checkbox" id="onboard-keepbg" />
+            Keep syncing in the background (install a login service)
+          </label>
+          <button class="btn primary big" id="onboard-go">Set up &amp; start syncing</button>
+        </div>
+
+        <div id="onboard-start" hidden>
+          <p class="muted">This device is set up, but sync isn't running.</p>
+          <button class="btn primary big" id="onboard-startbtn">Start syncing</button>
+        </div>
+
+        <div class="banner" id="onboard-msg" hidden></div>
+        <p class="onboard-foot muted">Daemon binary: <code id="onboard-bin">…</code></p>
+      </div>
+    </div>
+
+    <!-- Active transfers panel -->
+    <div id="transfers" class="transfers-panel" hidden></div>
+
+    <!-- Toasts -->
+    <div id="toasts" class="toasts"></div>
 
     <script src="app.js"></script>
   </body>

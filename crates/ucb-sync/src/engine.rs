@@ -200,6 +200,12 @@ struct SessionEntry {
     /// Distinguishes concurrent sessions for the same peer so a closing session
     /// never deregisters a newer one.
     token: u64,
+    /// True if this session runs over the *canonical* connection — the one
+    /// dialed by the numerically smaller [`DeviceId`]. On a simultaneous open
+    /// (both sides dial, e.g. a GUI eager dial racing the peer's own dial) both
+    /// ends deterministically keep the canonical connection and drop the other,
+    /// so the duplicate never collapses the live session.
+    canonical: bool,
     tx: mpsc::Sender<Outbound>,
 }
 
@@ -380,6 +386,38 @@ impl SyncEngine {
     /// returns a fresh receiver; only events sent after subscription are seen.
     pub fn subscribe_transfers(&self) -> broadcast::Receiver<TransferEvent> {
         self.shared.transfers.subscribe()
+    }
+
+    /// Live trust (GUI wave): add `device` to the running engine's allowlist and
+    /// immediately try to connect, so a freshly-paired peer syncs *without*
+    /// restarting the daemon.
+    ///
+    /// The on-disk `trusted.json` is written separately by the pairing flow, so
+    /// this reloads the allowlist from disk first (staying coherent with that
+    /// write, MAX_DEVICES and tombstones), then ensures `device` is present.
+    /// Trusting a tombstoned or over-cap device returns an error and dials
+    /// nothing (PAIR-5/PAIR-7).
+    ///
+    /// If discovery already knows where the peer is, it is dialed eagerly —
+    /// ignoring the device-id dial-ordering rule for this one first dial, but
+    /// guarded so it never creates a duplicate session. Otherwise the peer
+    /// connects the usual way once discovered or when it dials in.
+    pub fn trust_peer(&self, device: DeviceInfo, static_pubkey: [u8; 32]) -> Result<()> {
+        {
+            let mut allowlist = self.shared.allowlist.lock().unwrap();
+            // The pairing flow already persisted this peer with a coherent
+            // cap/tombstone check; reload so the running engine observes it.
+            if let Ok(fresh) = Allowlist::load(&self.shared.allowlist_path) {
+                *allowlist = fresh;
+            }
+            if !allowlist.is_trusted(&device.id) {
+                // Not on disk yet (defensive path): add now, honoring the cap
+                // and tombstones. Errors propagate so callers see e.g. the cap.
+                allowlist.add(device.id, device.name.clone(), &static_pubkey, now_ms())?;
+            }
+        }
+        self.shared.clone().eager_dial(device.id);
+        Ok(())
     }
 
     /// HIST-4: broadcast a star/unstar (by content hash) to every connected
@@ -629,7 +667,8 @@ impl Shared {
         }
 
         let peer = self.hello_exchange(&mut chan).await?;
-        self.run_session(chan, remote_id, peer.name).await;
+        // `dialed = false`: the peer initiated this connection.
+        self.run_session(chan, remote_id, peer.name, false).await;
         Ok(())
     }
 
@@ -656,7 +695,9 @@ impl Shared {
         }
 
         let peer = self.hello_exchange(&mut chan).await?;
-        self.run_session(chan, remote_id, peer.name).await;
+        // `dialed = true`: we initiated this connection (see `run_session`'s
+        // simultaneous-open tiebreak).
+        self.run_session(chan, remote_id, peer.name, true).await;
         Ok(())
     }
 
@@ -684,6 +725,34 @@ impl Shared {
         tracing::debug!(peer = %peer_id.short(), "connector stopped (peer lost)");
     }
 
+    /// Eagerly dial `peer_id` once, right after it becomes trusted live via the
+    /// GUI (see [`SyncEngine::trust_peer`]). Ignores the device-id dial-ordering
+    /// rule for this single dial so a session forms immediately, but is a no-op
+    /// when we already hold a live session, when a reconnecting connector is
+    /// already handling this peer, or when discovery has not yet given us an
+    /// endpoint (in which case the normal discovery/inbound path connects us).
+    fn eager_dial(self: Arc<Self>, peer_id: DeviceId) {
+        if self.sessions.lock().unwrap().contains_key(&peer_id) {
+            return; // already connected
+        }
+        if self.connectors.lock().unwrap().contains_key(&peer_id) {
+            return; // a reconnecting connector will dial it
+        }
+        if !self.peers.lock().unwrap().contains_key(&peer_id) {
+            return; // no known endpoint yet; discovery/inbound will connect us
+        }
+        let me = self.clone();
+        tokio::spawn(async move {
+            // Re-check under the race: another path may have connected already.
+            if me.sessions.lock().unwrap().contains_key(&peer_id) {
+                return;
+            }
+            if let Err(e) = me.clone().dial_and_run(peer_id).await {
+                tracing::debug!(peer = %peer_id.short(), error = %e, "eager dial after trust failed");
+            }
+        });
+    }
+
     // --- static peers (DISC-3) --------------------------------------------
 
     /// Dial a static peer at `addr`, verify trust, and run one session. Unlike
@@ -704,7 +773,8 @@ impl Shared {
         }
 
         let peer = self.hello_exchange(&mut chan).await?;
-        self.run_session(chan, remote_id, peer.name).await;
+        // `dialed = true`: we initiated this static-peer connection.
+        self.run_session(chan, remote_id, peer.name, true).await;
         Ok(())
     }
 
@@ -769,15 +839,32 @@ impl Shared {
         mut chan: SecureChannel<S>,
         peer_id: DeviceId,
         peer_name: String,
+        dialed: bool,
     ) where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
         let token = self.next_token();
+        // The canonical connection is the one dialed by the smaller-id device.
+        // Both ends compute this identically, so a simultaneous open resolves to
+        // the same surviving connection on both sides.
+        let canonical = (self.self_id < peer_id) == dialed;
         let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(peer_id, SessionEntry { token, tx: out_tx });
+        {
+            let mut sessions = self.sessions.lock().unwrap();
+            if let Some(existing) = sessions.get(&peer_id) {
+                // Keep exactly one connection per peer, chosen deterministically.
+                // Only a canonical connection may evict a non-canonical one; any
+                // other duplicate is dropped so the live session is never
+                // collapsed by the loser of a simultaneous open.
+                let this_wins = canonical && !existing.canonical;
+                if !this_wins {
+                    tracing::debug!(peer = %peer_id.short(), "dropping duplicate session; one is already live");
+                    return;
+                }
+                tracing::debug!(peer = %peer_id.short(), "canonical connection replacing a non-canonical duplicate");
+            }
+            sessions.insert(peer_id, SessionEntry { token, canonical, tx: out_tx });
+        }
         tracing::info!(peer = %peer_id.short(), name = %peer_name, "session established");
 
         let mut guard = ReplayGuard::new();

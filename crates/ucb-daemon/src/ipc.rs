@@ -25,7 +25,7 @@ use tokio::sync::mpsc;
 use ucb_core::{DeviceId, DeviceInfo, Platform, PROTOCOL_VERSION};
 use ucb_crypto::Identity;
 use ucb_history::{History, HistoryQuery};
-use ucb_sync::{pair_listen, SendProgress, SyncEngine};
+use ucb_sync::{pair_dial, pair_listen, SendProgress, SyncEngine, TransferEvent, TrustedDevice};
 
 use crate::config::{Config, Paths};
 use crate::pairing;
@@ -79,12 +79,29 @@ pub enum Request {
     HistoryDelete { id: i64 },
     /// Read the persisted daemon configuration (`config.json`).
     ConfigGet,
-    /// Change persisted configuration. Currently only `auto_file_sync` (FILE-1);
-    /// the running engine does not hot-reload it, so the reply reports
-    /// `restart_required: true`.
-    ConfigSet { auto_file_sync: Option<bool> },
+    /// Change persisted configuration: `auto_file_sync` (FILE-1) and/or
+    /// `max_auto_file_bytes` (the per-file auto-sync cap). The running engine
+    /// does not hot-reload config, so the reply reports `restart_required: true`.
+    ConfigSet {
+        auto_file_sync: Option<bool>,
+        max_auto_file_bytes: Option<u64>,
+    },
     /// Revoke a trusted peer by device-id prefix (PAIR-7), live in the engine.
     Revoke { prefix: String },
+    /// Snapshot every peer discovery has seen (trusted or not, connected or not),
+    /// for the GUI's "nearby devices" list. Replies with a single `{"peers":[…]}`
+    /// line from [`SyncEngine::discovered`].
+    Discovered,
+    /// Dial a listening peer to pair with it (the GUI's one-click "Pair"). `addr`
+    /// is a bare `ip:port` or a `ucb://ip:port` URI. Streams a `code` line, waits
+    /// for a [`Request::PairConfirm`] on the same connection, then a `result`
+    /// line. On success the peer is written to the allowlist AND trusted live in
+    /// the engine (so sync starts without a restart). One pairing at a time.
+    PairConnect { addr: String },
+    /// Subscribe to the live file-transfer event stream (GUI progress + toasts).
+    /// Streams one serde-tagged [`TransferEvent`] JSON line per event until the
+    /// client disconnects.
+    TransfersSubscribe,
     /// Begin an on-screen pairing session (PAIR-2 GUI). Streams a `pairing`
     /// line (URI + QR), then a `code` line once a peer connects, then blocks for
     /// a [`Request::PairConfirm`] on the same connection, then a `result` line.
@@ -149,13 +166,19 @@ pub struct IpcContext {
     pub device_name: String,
     /// This device's platform, sent in the pairing `Hello`.
     pub platform: Platform,
-    /// Guards "one pairing at a time": set while a `pair_listen_start` is live so
-    /// a concurrent one is rejected.
+    /// TCP port GUI-initiated pairing listens on (`listen_port + 1`, default
+    /// 48522), so a peer can dial it knowing only the IP. Falls back to an
+    /// ephemeral port if this one is already taken.
+    pairing_port: u16,
+    /// Guards "one pairing at a time": set while a `pair_listen_start` /
+    /// `pair_connect` is live so a concurrent one is rejected.
     pairing_active: Arc<AtomicBool>,
 }
 
 impl IpcContext {
-    /// Build the shared IPC context for `ucb run`.
+    /// Build the shared IPC context for `ucb run`. `listen_port` is the engine's
+    /// sync port; GUI pairing uses `listen_port + 1`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         engine: Arc<SyncEngine>,
         history: Option<Arc<History>>,
@@ -163,6 +186,7 @@ impl IpcContext {
         identity: Arc<Identity>,
         device_name: String,
         platform: Platform,
+        listen_port: u16,
     ) -> Self {
         Self {
             engine,
@@ -171,6 +195,7 @@ impl IpcContext {
             identity,
             device_name,
             platform,
+            pairing_port: listen_port.saturating_add(1),
             pairing_active: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -307,9 +332,22 @@ where
             };
             write_line(&mut write_half, &resp).await?;
         }
-        Request::ConfigSet { auto_file_sync } => {
-            let resp = handle_config_set(&ctx, auto_file_sync);
+        Request::ConfigSet {
+            auto_file_sync,
+            max_auto_file_bytes,
+        } => {
+            let resp = handle_config_set(&ctx, auto_file_sync, max_auto_file_bytes);
             write_line(&mut write_half, &resp).await?;
+        }
+        Request::Discovered => {
+            let resp = discovered_snapshot(&ctx.engine);
+            write_line(&mut write_half, &resp).await?;
+        }
+        Request::PairConnect { addr } => {
+            handle_pair_connect(&ctx, &addr, &mut reader, &mut write_half).await?;
+        }
+        Request::TransfersSubscribe => {
+            handle_transfers_subscribe(&ctx, &mut write_half).await?;
         }
         Request::Revoke { prefix } => {
             let resp = match ctx.engine.revoke_prefix(&prefix) {
@@ -346,7 +384,11 @@ where
 /// `ucb run` reads `config.json` once at startup and does not watch it, so a
 /// change here only takes effect on the next daemon start — surfaced to the
 /// caller as `restart_required: true`.
-fn handle_config_set(ctx: &IpcContext, auto_file_sync: Option<bool>) -> serde_json::Value {
+fn handle_config_set(
+    ctx: &IpcContext,
+    auto_file_sync: Option<bool>,
+    max_auto_file_bytes: Option<u64>,
+) -> serde_json::Value {
     let mut config = match Config::load(&ctx.paths) {
         Ok(c) => c,
         Err(e) => return serde_json::json!({ "ok": false, "detail": e.to_string() }),
@@ -354,9 +396,99 @@ fn handle_config_set(ctx: &IpcContext, auto_file_sync: Option<bool>) -> serde_js
     if let Some(v) = auto_file_sync {
         config.auto_file_sync = v;
     }
+    if let Some(v) = max_auto_file_bytes {
+        config.max_auto_file_bytes = v;
+    }
     match config.save(&ctx.paths) {
         Ok(()) => serde_json::json!({ "ok": true, "restart_required": true }),
         Err(e) => serde_json::json!({ "ok": false, "detail": e.to_string() }),
+    }
+}
+
+/// Snapshot [`SyncEngine::discovered`] for the GUI's "nearby devices" list.
+/// SEC-2: only names/endpoints/ids — never clipboard or file contents.
+fn discovered_snapshot(engine: &SyncEngine) -> serde_json::Value {
+    let peers: Vec<serde_json::Value> = engine
+        .discovered()
+        .into_iter()
+        .map(|p| {
+            serde_json::json!({
+                "id_short": p.device_id.short(),
+                "id": p.device_id.to_string(),
+                "name": p.name,
+                "addrs": p.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+                "port": p.port,
+                "trusted": p.trusted,
+                "connected": p.connected,
+            })
+        })
+        .collect();
+    serde_json::json!({ "peers": peers })
+}
+
+/// Serialize one [`TransferEvent`] as a serde-tagged JSON object for the GUI
+/// stream. SEC-2: carries names, sizes, chunk counts and the saved path only —
+/// never file contents. Device ids are rendered short + full (never raw bytes).
+fn transfer_event_json(ev: &TransferEvent) -> serde_json::Value {
+    match ev {
+        TransferEvent::RecvStarted { transfer_id, name, size, from } => serde_json::json!({
+            "type": "recv_started",
+            "transfer_id": transfer_id,
+            "name": name,
+            "size": size,
+            "from": from.short(),
+            "from_id": from.to_string(),
+        }),
+        TransferEvent::RecvProgress { transfer_id, received, total } => serde_json::json!({
+            "type": "recv_progress",
+            "transfer_id": transfer_id,
+            "received": received,
+            "total": total,
+        }),
+        TransferEvent::RecvCompleted { transfer_id, path, ok, detail } => serde_json::json!({
+            "type": "recv_completed",
+            "transfer_id": transfer_id,
+            "path": path.to_string_lossy(),
+            "ok": ok,
+            "detail": detail,
+        }),
+        TransferEvent::SendProgress { transfer_id, sent, total } => serde_json::json!({
+            "type": "send_progress",
+            "transfer_id": transfer_id,
+            "sent": sent,
+            "total": total,
+        }),
+        TransferEvent::SendCompleted { transfer_id, ok, name, detail } => serde_json::json!({
+            "type": "send_completed",
+            "transfer_id": transfer_id,
+            "ok": ok,
+            "name": name,
+            "detail": detail,
+        }),
+    }
+}
+
+/// Stream live [`TransferEvent`]s as JSON lines until the client disconnects.
+///
+/// The connection stays open; the client just reads lines. A write error means
+/// the client hung up (the normal way this ends), so it returns cleanly. A
+/// lagging subscriber that misses events is fine — transfer events are advisory.
+async fn handle_transfers_subscribe<W>(ctx: &IpcContext, out: &mut W) -> Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    let mut rx = ctx.engine.subscribe_transfers();
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let line = transfer_event_json(&ev);
+                if write_line(out, &line).await.is_err() || out.flush().await.is_err() {
+                    return Ok(()); // client disconnected
+                }
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+        }
     }
 }
 
@@ -415,12 +547,27 @@ impl Drop for PairingGuard {
     }
 }
 
+/// Bind the GUI pairing listener on the fixed `pairing_port` (`listen_port + 1`,
+/// default 48522) so a peer can dial it knowing only the IP. Falls back to an
+/// ephemeral port if the fixed one is taken; the streamed `pairing` URI carries
+/// the actual port either way.
+async fn bind_pairing_listener(pairing_port: u16) -> std::io::Result<tokio::net::TcpListener> {
+    match tokio::net::TcpListener::bind(("0.0.0.0", pairing_port)).await {
+        Ok(l) => Ok(l),
+        Err(_) => tokio::net::TcpListener::bind(("0.0.0.0", 0)).await,
+    }
+}
+
 /// Drive an on-screen pairing session over this one IPC connection (PAIR-2 GUI).
 ///
 /// Because `ucb run` already owns the configured sync port, pairing binds a
-/// *fresh ephemeral* TCP listener and advertises that endpoint in the URI/QR —
-/// the peer dials it with `ucb pair --connect ucb://ip:port`. Only one pairing
-/// runs at a time; a concurrent request is rejected.
+/// listener on the fixed pairing port (`listen_port + 1`, ephemeral fallback)
+/// and advertises that endpoint in the URI/QR — the peer dials it with
+/// `ucb pair --connect ucb://ip:port`. Only one pairing runs at a time; a
+/// concurrent request is rejected.
+///
+/// On success the peer is trusted *live* in the engine (`SyncEngine::trust_peer`),
+/// so sync starts without restarting the daemon.
 ///
 /// Bridge: `pair_listen`'s confirmation callback is synchronous, so it hands the
 /// 6-digit code to this async task over a channel and blocks (via
@@ -449,8 +596,8 @@ where
     }
     let _guard = PairingGuard(ctx.pairing_active.clone());
 
-    // Bind a fresh ephemeral listener (the sync port is taken by the engine).
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", 0)).await {
+    // Bind the fixed pairing port (ephemeral fallback if it is taken).
+    let listener = match bind_pairing_listener(ctx.pairing_port).await {
         Ok(l) => l,
         Err(e) => {
             write_line(
@@ -509,6 +656,7 @@ where
     });
 
     // Wait for the handshake to produce a verification code (or fail first).
+    let mut peer_info: Option<DeviceInfo> = None;
     match code_rx.recv().await {
         Some((code, device)) => {
             write_line(
@@ -525,6 +673,7 @@ where
             )
             .await?;
             out.flush().await?;
+            peer_info = Some(device);
 
             // Read the user's decision (PairConfirm) on this same connection.
             let accept = read_pair_confirm(reader).await;
@@ -536,15 +685,150 @@ where
         }
     }
 
-    let result = match task.await {
-        Ok(Ok(dev)) => serde_json::json!({ "type": "result", "ok": true, "name": dev.name }),
+    let result = pairing_result(&ctx.engine, task.await, peer_info);
+    write_line(out, &result).await?;
+    Ok(())
+}
+
+/// Turn a finished pairing task into the terminal `result` line, and — on
+/// success — trust the peer *live* in the engine so sync starts immediately.
+///
+/// `peer_info` (captured from the verification-code step) carries the peer's
+/// platform; combined with the `TrustedDevice`'s static key it forms the
+/// [`DeviceInfo`] passed to [`SyncEngine::trust_peer`]. A `trust_peer` failure
+/// (e.g. the device cap) is surfaced but the on-disk pairing already succeeded.
+fn pairing_result(
+    engine: &SyncEngine,
+    task: std::result::Result<
+        std::result::Result<TrustedDevice, ucb_sync::Error>,
+        tokio::task::JoinError,
+    >,
+    peer_info: Option<DeviceInfo>,
+) -> serde_json::Value {
+    match task {
+        Ok(Ok(dev)) => {
+            let info = peer_info.unwrap_or(DeviceInfo {
+                id: dev.device_id,
+                name: dev.name.clone(),
+                platform: Platform::current(),
+            });
+            if let Err(e) = engine.trust_peer(info, dev.static_pubkey) {
+                tracing::warn!(error = %e, "paired on disk but live trust failed");
+            }
+            serde_json::json!({ "type": "result", "ok": true, "name": dev.name })
+        }
         Ok(Err(e)) => {
             serde_json::json!({ "type": "result", "ok": false, "message": e.to_string() })
         }
         Err(e) => serde_json::json!({
             "type": "result", "ok": false, "message": format!("pairing task failed: {e}")
         }),
+    }
+}
+
+/// Drive a GUI-initiated *outgoing* pairing (`pair_connect`) over this one IPC
+/// connection: dial `addr` (a bare `ip:port` or a `ucb://ip:port` URI), stream
+/// the 6-digit `code` line, wait for a [`Request::PairConfirm`] on the same
+/// connection, then emit a `result` line. On success the peer is trusted live
+/// in the engine so sync starts without a restart. One pairing at a time.
+async fn handle_pair_connect<R, W>(
+    ctx: &IpcContext,
+    addr: &str,
+    reader: &mut R,
+    out: &mut W,
+) -> Result<()>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWriteExt + Unpin,
+{
+    // One pairing at a time (shared slot with pair_listen_start).
+    if ctx
+        .pairing_active
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        write_line(
+            out,
+            &serde_json::json!({
+                "type": "error",
+                "message": "another pairing is already in progress"
+            }),
+        )
+        .await?;
+        return Ok(());
+    }
+    let _guard = PairingGuard(ctx.pairing_active.clone());
+
+    let target = match crate::pairing::parse_pairing_target(addr) {
+        Ok(t) => t,
+        Err(e) => {
+            write_line(
+                out,
+                &serde_json::json!({ "type": "error", "message": e.to_string() }),
+            )
+            .await?;
+            return Ok(());
+        }
     };
+
+    // Bridge channels: code out to us, the user's decision back to the callback.
+    let (code_tx, mut code_rx) = mpsc::unbounded_channel::<(String, DeviceInfo)>();
+    let (decision_tx, decision_rx) = tokio::sync::oneshot::channel::<bool>();
+    let mut decision_rx = Some(decision_rx);
+    let confirm = move |code: &str, peer: &DeviceInfo| -> bool {
+        if code_tx.send((code.to_string(), peer.clone())).is_err() {
+            return false;
+        }
+        match decision_rx.take() {
+            Some(rx) => tokio::task::block_in_place(|| rx.blocking_recv()).unwrap_or(false),
+            None => false,
+        }
+    };
+
+    let identity = ctx.identity.clone();
+    let allowlist_path = ctx.paths.trusted_file.clone();
+    let device_name = ctx.device_name.clone();
+    let platform = ctx.platform;
+    let task = tokio::spawn(async move {
+        pair_dial(
+            &target,
+            identity.as_ref(),
+            allowlist_path,
+            &device_name,
+            platform,
+            confirm,
+        )
+        .await
+    });
+
+    let mut peer_info: Option<DeviceInfo> = None;
+    match code_rx.recv().await {
+        Some((code, device)) => {
+            write_line(
+                out,
+                &serde_json::json!({
+                    "type": "code",
+                    "code": code,
+                    "device": {
+                        "id": device.id.to_string(),
+                        "name": device.name,
+                        "platform": device.platform,
+                    }
+                }),
+            )
+            .await?;
+            out.flush().await?;
+            peer_info = Some(device);
+            let accept = read_pair_confirm(reader).await;
+            let _ = decision_tx.send(accept);
+        }
+        None => {
+            // Handshake failed before a code (e.g. connection refused / wrong
+            // port). Fall through to report the task's error.
+        }
+    }
+
+    let result = pairing_result(&ctx.engine, task.await, peer_info);
     write_line(out, &result).await?;
     Ok(())
 }

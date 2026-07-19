@@ -1032,6 +1032,73 @@ async fn star_syncs_a_to_b_and_does_not_loop() {
     assert!(!by_text(&hist_a).unwrap().starred, "A star changed unexpectedly");
 }
 
+// --- Live trust (GUI wave): trust_peer -----------------------------------
+
+/// `trust_peer` makes a not-yet-trusted peer sync *without restarting* either
+/// engine: with both engines already running and discovery aware of each other
+/// (but neither trusted), calling `trust_peer` on both establishes a session and
+/// a clip flows A -> B.
+#[tokio::test]
+async fn trust_peer_connects_live_without_restart() {
+    use ucb_core::DeviceInfo;
+
+    let dir_a = temp_dir("trust-live-a");
+    let dir_b = temp_dir("trust-live-b");
+    let id_a = Identity::load_or_generate(&FileKeyStore::new(dir_a.join("keys"))).unwrap();
+    let id_b = Identity::load_or_generate(&FileKeyStore::new(dir_b.join("keys"))).unwrap();
+    let (dev_a, pk_a) = (id_a.device_id(), id_a.public_key());
+    let (dev_b, pk_b) = (id_b.device_id(), id_b.public_key());
+
+    // Neither side trusts the other yet (empty allowlists).
+    let al_a = dir_a.join("trusted.json");
+    let al_b = dir_b.join("trusted.json");
+    let (node_a, port_a) = start_node("A", id_a, al_a).await;
+    let (node_b, port_b) = start_node("B", id_b, al_b).await;
+
+    // Discovery sees both peers, but since neither is trusted no connector starts
+    // and no session forms.
+    node_a.disc_tx.send(peer_event(dev_b, "B", port_b)).await.unwrap();
+    node_b.disc_tx.send(peer_event(dev_a, "A", port_a)).await.unwrap();
+
+    // Give discovery a moment to populate the peer maps, then confirm still
+    // disconnected (no trust yet).
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !node_a.engine.status().iter().any(|p| p.connected),
+        "A must not be connected before trust"
+    );
+
+    // Trust each other live — no restart.
+    node_a
+        .engine
+        .trust_peer(
+            DeviceInfo { id: dev_b, name: "B".into(), platform: Platform::Linux },
+            pk_b,
+        )
+        .unwrap();
+    node_b
+        .engine
+        .trust_peer(
+            DeviceInfo { id: dev_a, name: "A".into(), platform: Platform::Linux },
+            pk_a,
+        )
+        .unwrap();
+
+    // A session establishes on both sides purely from the eager dial.
+    let connected = wait_for(|| {
+        let a_up = node_a.engine.status().iter().any(|p| p.connected);
+        let b_up = node_b.engine.status().iter().any(|p| p.connected);
+        (a_up && b_up).then_some(())
+    })
+    .await;
+    assert!(connected.is_some(), "trust_peer did not connect the engines live");
+
+    // And a clip flows over the freshly-formed session.
+    node_a.handle.set("live-trust");
+    let got = wait_for(|| node_b.handle.get().filter(|s| s == "live-trust").map(|_| ())).await;
+    assert!(got.is_some(), "clip did not sync after live trust_peer");
+}
+
 // --- Additive engine surface: discovered() -------------------------------
 
 /// `discovered()` lists every peer mDNS has seen — an untrusted `Found` peer

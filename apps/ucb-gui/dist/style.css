@@ -170,9 +170,107 @@ code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; }
 /* Spinner (UX-3): only revealed by JS after the 350ms threshold. */
 .spinner { width: 16px; height: 16px; display: none; }
 .spinner.show { display: inline-block; }
+.spinner.inline { vertical-align: -3px; }
 .spinner::after {
   content: ""; display: block; width: 16px; height: 16px; border-radius: 50%;
   border: 2px solid var(--border); border-top-color: var(--brand);
   animation: spin .7s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* Header sync control. */
+.sync-control { display: flex; align-items: center; gap: 8px; }
+.sync-label { font-size: 12px; color: var(--muted); font-weight: 600; }
+
+/* Devices actions + section titles. */
+.actions-row {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 16px;
+}
+.addr-add { display: flex; gap: 6px; flex: 1; min-width: 220px; }
+.addr-add input {
+  flex: 1; padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+}
+.section-title { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+  color: var(--muted); margin: 18px 0 8px; }
+.platform-tag { font-size: 11px; color: var(--muted); margin-left: 6px; }
+
+/* Modal. */
+.modal-backdrop {
+  position: fixed; inset: 0; background: rgba(0,0,0,.45);
+  display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
+}
+.modal {
+  position: relative; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 14px; padding: 22px; width: 100%; max-width: 460px;
+  max-height: 90vh; overflow-y: auto;
+}
+.modal h2 { margin-top: 0; }
+.modal-close {
+  position: absolute; top: 10px; right: 10px; border: none; background: transparent;
+  color: var(--muted); font-size: 16px; cursor: pointer; padding: 4px 8px; border-radius: 6px;
+}
+.modal-close:hover { background: var(--panel-2); }
+
+/* Onboarding overlay. */
+.onboard-backdrop {
+  position: fixed; inset: 0; background: var(--bg);
+  display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 100;
+}
+.onboard-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+  padding: 30px; width: 100%; max-width: 440px; text-align: center;
+}
+.onboard-glyph { font-size: 40px; margin-bottom: 8px; }
+.onboard-card h1 { margin: 6px 0 10px; }
+.onboard-card input[type=text] {
+  width: 100%; padding: 9px 12px; border-radius: 9px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text); margin-bottom: 12px;
+}
+.onboard-card .fieldlabel { text-align: left; }
+.onboard-bg { justify-content: center; margin-bottom: 16px; }
+.btn.big { width: 100%; padding: 11px 16px; font-size: 15px; }
+.onboard-foot { font-size: 11px; margin-top: 18px; word-break: break-all; }
+.banner.warn {
+  background: color-mix(in srgb, var(--star) 20%, transparent); color: var(--text);
+  display: flex; align-items: center; justify-content: space-between; gap: 10px;
+}
+
+/* Settings inline field. */
+.field-inline { display: flex; align-items: center; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.field-inline label { font-size: 13px; }
+.field-inline input[type=number] {
+  width: 96px; padding: 6px 9px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text);
+}
+
+/* Active transfers panel. */
+.transfers-panel {
+  position: fixed; right: 16px; bottom: 16px; width: 320px; max-width: calc(100vw - 32px);
+  display: flex; flex-direction: column; gap: 8px; z-index: 40;
+}
+.xfer {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; box-shadow: 0 4px 16px rgba(0,0,0,.12);
+}
+.xfer .xfer-head { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+.xfer .xfer-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xfer .xfer-meta { color: var(--muted); font-size: 11px; white-space: nowrap; }
+.xfer .bar { height: 6px; border-radius: 999px; background: var(--panel-2); margin-top: 8px; overflow: hidden; }
+.xfer .bar > i { display: block; height: 100%; width: 0; background: var(--brand); transition: width .2s ease; }
+
+/* Toasts. */
+.toasts {
+  position: fixed; left: 50%; bottom: 16px; transform: translateX(-50%);
+  display: flex; flex-direction: column; gap: 8px; z-index: 60; align-items: center;
+}
+.toast {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 14px; box-shadow: 0 6px 20px rgba(0,0,0,.16);
+  display: flex; align-items: center; gap: 10px; max-width: 92vw;
+  animation: toast-in .18s ease;
+}
+.toast.ok { border-left: 3px solid var(--ok); }
+.toast.err { border-left: 3px solid var(--danger); }
+.toast .toast-msg { font-size: 13px; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
