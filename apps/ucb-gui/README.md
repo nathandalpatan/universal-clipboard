@@ -25,8 +25,11 @@ no CLI. It still speaks to the daemon over the unix socket, but it can also
   service (`ucb service install --activate`); otherwise the GUI spawns a
   **managed** `ucb run` child that it kills when the app quits.
 - **Binary search order** (documented, used by onboarding + `ucb_binary_path`):
-  `UCB_BIN` → next to the GUI executable → `target/{release,debug}/ucb` above the
-  executable (dev checkout) → bare `ucb` on `PATH`.
+  **bundled sidecar** (`ucb` next to the GUI executable — where the Tauri bundler
+  places the `externalBin`, so it wins in a real install) → `UCB_BIN` → 
+  `target/{release,debug}/ucb` above the executable (dev checkout) → bare `ucb`
+  on `PATH`. In a dev checkout the sidecar step finds nothing (the GUI's own
+  `target/` has no `ucb` beside `ucb-gui`), so the dev fallbacks apply as before.
 - **Header sync control.** A status dot + "Sync on · N/M connected" label and a
   **Start/Stop sync** button (Stop only shown for a GUI-managed daemon; a
   background-service daemon is left alone).
@@ -182,17 +185,116 @@ These run inside the GUI process:
   `ucb run` child.
 - `reveal_in_folder(path)` — "Show in folder" (shells out to
   `open -R` / `explorer /select,` / `xdg-open`; no Tauri plugin required).
+- `check_for_update()` → `{ available, version?, notes? }` and `install_update()`
+  — REL-1 auto-updater (wraps `tauri-plugin-updater`; download is signature-
+  verified, then the app relaunches). Called from the frontend so the no-npm UI
+  needs no JS plugin bindings.
+
+## Packaging, install & auto-update (REL-1)
+
+The GUI ships as a real installable app with the `ucb` daemon bundled inside it,
+plus a GitHub-releases-backed auto-updater.
+
+### The `ucb` sidecar
+
+The daemon binary is shipped **inside** the app bundle as a Tauri v2
+[sidecar](https://v2.tauri.app/develop/sidecar/) (`bundle.externalBin` in
+`tauri.conf.json` → `binaries/ucb`). Tauri sidecars must be suffixed with the
+Rust target triple so a build can pick the right one; the bundler strips the
+suffix again when it copies the file next to the app executable
+(`…/Contents/MacOS/ucb`). Stage it before any bundle build:
+
+```sh
+cargo build --release -p ucb-daemon        # from the repo root
+bash scripts/prepare-sidecar.sh            # copies target/release/ucb → apps/ucb-gui/binaries/ucb-<triple>
+# scripts/prepare-sidecar.sh <triple>      # override the triple for cross/CI builds
+```
+
+`binaries/` is git-ignored — it is a build output, regenerated per platform.
+
+### Icons
+
+`scripts/gen-icons.py` (Pillow + `iconutil`) renders the clipboard glyph and
+writes the full set into `icons/` — `32x32.png`, `128x128.png`,
+`128x128@2x.png`, `512x512.png`, `icon.png` (1024²), `icon.icns` (macOS),
+`icon.ico` (Windows). The outputs are committed; regenerate with
+`python3 scripts/gen-icons.py`.
+
+### Building installers
+
+```sh
+cargo install tauri-cli --version '^2' --locked   # one-time
+cargo build --release -p ucb-daemon               # repo root
+bash scripts/prepare-sidecar.sh
+cd apps/ucb-gui && cargo tauri build              # → target/release/bundle/
+```
+
+Configured bundle targets: macOS `.app` + `.dmg`, Windows `.msi` + NSIS,
+Linux `.deb` + `.AppImage` (Tauri only builds the targets valid for the host).
+`productName` "Universal Clipboard", identifier `dev.ucb.universal-clipboard`,
+version `0.1.0` (kept in sync with the crate version).
+
+### macOS signing & notarization
+
+`bundle.macOS.signingIdentity` is `"-"` (**ad-hoc** signing) — the app is signed
+but with no Apple Developer ID, so it is **not notarized**. Users will see
+Gatekeeper's "unidentified developer" warning and must right-click → **Open** on
+first launch. For real distribution, set the `APPLE_SIGNING_IDENTITY` /
+`APPLE_CERTIFICATE` and notarization env vars (`APPLE_ID`, `APPLE_PASSWORD`,
+`APPLE_TEAM_ID`) so `tauri build` signs with your Developer ID and notarizes.
+
+### Auto-updater & signing key
+
+The app uses `tauri-plugin-updater`, pointed at the GitHub "latest release"
+`latest.json` convention:
+
+```
+https://github.com/nathandalpatan/universal-clipboard/releases/latest/download/latest.json
+```
+
+On launch the GUI **silently** checks for an update (`check_for_update` command)
+and only raises a toast — with an **Install & restart** button — if one exists.
+**Settings → Software updates → Check for updates** runs the same check manually
+and always reports the result (including "up to date"). Downloads are verified
+against the updater **public key** embedded in `tauri.conf.json`
+(`plugins.updater.pubkey`) before install.
+
+The matching **private key** lives at `apps/ucb-gui/.updater-key` (generated with
+`cargo tauri signer generate`). **It is git-ignored and must NEVER be committed.**
+The updater will only trust artifacts signed with it, so:
+
+1. Store the private key as a GitHub Actions secret named
+   **`TAURI_SIGNING_PRIVATE_KEY`** (paste the *contents* of
+   `apps/ucb-gui/.updater-key`):
+   ```sh
+   gh secret set TAURI_SIGNING_PRIVATE_KEY < apps/ucb-gui/.updater-key
+   ```
+   The key here has an **empty password**; if you regenerate it with a password,
+   also set `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
+2. Keep a secure backup of `apps/ucb-gui/.updater-key`. **If you lose it you can
+   never sign a compatible update again** — every installed client is pinned to
+   the public key baked into its binary.
+
+To regenerate the keypair (rotates the pubkey → breaks updates for already-shipped
+clients until they reinstall):
+
+```sh
+cargo tauri signer generate --ci -p "" -w apps/ucb-gui/.updater-key -f
+# then copy the printed public key into tauri.conf.json → plugins.updater.pubkey
+```
+
+### Release CI
+
+`.github/workflows/release.yml` runs on a `v*` tag: a matrix of
+macOS (aarch64 + x86_64), Ubuntu, and Windows builds the daemon, stages the
+sidecar, and hands off to `tauri-apps/tauri-action`, which builds the installers,
+signs the updater artifacts with `TAURI_SIGNING_PRIVATE_KEY`, assembles
+`latest.json`, and uploads everything to the (draft) GitHub release for the tag.
+Publish the draft to make the update live. `ci.yml` additionally builds + clippy
++ tests the GUI on `macos-latest` on every push/PR.
 
 ## Not done yet (future work)
 
-- **REL-1 (packaging wave)**: bundling, code-signing, and the auto-updater. Right
-  now this is `cargo run` only; no `.app`/`.dmg`/`.deb` packaging and no updater
-  are wired. The `bundle` section in `tauri.conf.json` and the placeholder
-  `icons/` exist as a starting point, but real icon assets and signing config are
-  still needed. **Binary-location assumption to revisit:** onboarding locates
-  `ucb` next to the GUI executable or in a dev `target/` dir; a real installer
-  should ship `ucb` as a Tauri **sidecar** and have the GUI resolve the sidecar
-  path instead of searching, removing the PATH fallback.
 - **Windows/named-pipe client**: the IPC client is unix-socket only; on Windows
   the commands return an "unsupported" error (the daemon speaks named pipes
   there — a small client addition would close this).

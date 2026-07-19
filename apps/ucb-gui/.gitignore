@@ -1,0 +1,8 @@
+# Tauri updater signing key — NEVER commit. The private key belongs only in the
+# TAURI_SIGNING_PRIVATE_KEY GitHub Actions secret (see README). The matching
+# public key lives in tauri.conf.json.
+.updater-key
+.updater-key.pub
+
+# Staged sidecar binaries: rebuilt by scripts/prepare-sidecar.sh, not committed.
+binaries/

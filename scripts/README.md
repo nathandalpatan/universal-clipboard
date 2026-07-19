@@ -6,10 +6,26 @@ and the cargo-fuzz project.
 
 | Ticket | What | Where |
 |---|---|---|
-| REL-1 (partial) | CI: build/test/lint/artifact on Linux + macOS | `.github/workflows/ci.yml` |
+| REL-1 | CI: build/test/lint/artifact on Linux + macOS (+ GUI check) | `.github/workflows/ci.yml` |
+| REL-1 | Signed, updatable release build on `v*` tags | `.github/workflows/release.yml` |
+| REL-1 | Stage the `ucb` daemon as a Tauri sidecar | `scripts/prepare-sidecar.sh` |
+| REL-1 | Regenerate the app icon set (clipboard glyph) | `scripts/gen-icons.py` |
 | TEST-1 | Two-device Docker integration harness | `docker/`, `scripts/harness-test.sh` |
 | TEST-2 | netem fault injection presets | `scripts/netem.sh` |
 | TEST-4 | cargo-fuzz targets for the wire parser | `fuzz/` |
+
+## Packaging & release (REL-1)
+
+`scripts/prepare-sidecar.sh` copies the release `ucb` daemon into
+`apps/ucb-gui/binaries/ucb-<target-triple>` so the Tauri bundler can ship it
+inside the app; `scripts/gen-icons.py` (Pillow + `iconutil`) regenerates the
+committed icon set. `.github/workflows/release.yml` runs on a `v*` tag: a
+macOS (aarch64 + x86_64) / Ubuntu / Windows matrix builds the daemon, stages the
+sidecar, and `tauri-action` builds the installers (`.dmg`/`.app`, `.msi`/NSIS,
+`.deb`/`.AppImage`), signs the updater artifacts with the
+`TAURI_SIGNING_PRIVATE_KEY` secret, and uploads them plus `latest.json` to the
+release. Full build/updater/notarization details live in
+`apps/ucb-gui/README.md`.
 
 ## Docker harness (TEST-1)
 
@@ -115,7 +131,8 @@ corpus accumulates under `fuzz/corpus/<target>/`.
 5. `cargo build --release -p ucb-daemon`
 6. Upload the `ucb` binary as an artifact.
 
-**Future work (not in this workflow):** signed release publishing via the
-tauri-updater / signed-manifest pipeline (code-signing, notarization, hosted
-update manifest) is not wired up yet — CI only uploads an unsigned build
-artifact.
+Signed release publishing (code-signing, the tauri-updater signed-manifest
+pipeline, and a hosted `latest.json`) now lives in
+`.github/workflows/release.yml` (REL-1); see the Packaging & release section
+above. macOS builds are ad-hoc signed and **not notarized** — adding Apple
+Developer ID signing + notarization secrets is the remaining distribution step.

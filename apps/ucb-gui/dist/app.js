@@ -1065,10 +1065,68 @@ function renderSettings() {
   }
 }
 
+// --- software updates (REL-1) ----------------------------------------------
+
+// Offer to install a found update via a toast with an Install button. Shared by
+// the silent launch auto-check and the manual "Check for updates" button.
+function offerUpdate(info) {
+  toast(
+    `Version ${info.version} is available.`,
+    "ok",
+    [
+      {
+        label: "Install & restart",
+        onClick: async () => {
+          toast("Downloading update…");
+          try {
+            // On success the app relaunches, so this never resolves.
+            await invoke("install_update");
+          } catch (e) {
+            toast(`Update failed: ${e}`, "err");
+          }
+        },
+      },
+    ],
+    0 // no auto-dismiss — the user should decide
+  );
+}
+
+// Silent auto-check on launch: only surfaces UI if an update actually exists.
+async function autoCheckUpdates() {
+  try {
+    const info = await invoke("check_for_update");
+    if (info && info.available) offerUpdate(info);
+  } catch {
+    /* offline / no manifest yet — stay silent on launch */
+  }
+}
+
+// Manual check from Settings: always gives feedback, including "up to date".
+$("#check-updates").addEventListener("click", async () => {
+  const status = $("#update-status");
+  const btn = $("#check-updates");
+  btn.disabled = true;
+  status.textContent = "Checking…";
+  try {
+    const info = await invoke("check_for_update");
+    if (info && info.available) {
+      status.textContent = `Update available: ${info.version}`;
+      offerUpdate(info);
+    } else {
+      status.textContent = "You're up to date.";
+    }
+  } catch (e) {
+    status.textContent = `Update check failed: ${e}`;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 // --- boot ------------------------------------------------------------------
 
 initCapabilities();
 pollStatus().then(() => refreshDevices());
+autoCheckUpdates();
 
 setInterval(() => {
   pollStatus();
