@@ -4,10 +4,10 @@
 # Linux and macOS, then produce a release `ucb` daemon binary as a downloadable
 # artifact.
 #
-# FUTURE WORK (out of scope for REL-1 here): signed release publishing via the
-# tauri-updater / signed-manifest pipeline (code-signing, notarization, and a
-# self-hosted update manifest) is not wired up yet. This workflow only uploads
-# an unsigned CI build artifact for smoke-testing.
+# Signed release publishing (code-signing, the tauri-updater signed-manifest
+# pipeline, and a hosted latest.json) lives in .github/workflows/release.yml,
+# which runs on `v*` tags. This CI workflow uploads an unsigned `ucb` build
+# artifact for smoke-testing and lightly checks the Tauri GUI on macOS.
 name: CI
 
 on:
@@ -115,3 +115,44 @@ jobs:
           path: target/release/ucb.exe
           if-no-files-found: warn
           retention-days: 14
+
+  # REL-1: lightly exercise the standalone Tauri GUI (apps/ucb-gui) — build,
+  # clippy, and test. macOS-only to keep CI time sane (the GUI's native code is
+  # mostly macOS-specific anyway: NSWindow capture exclusion, Touch ID). The GUI
+  # is its own cargo workspace, so this does not touch the root workspace build.
+  gui-check:
+    name: gui build/clippy/test (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\napps/ucb-gui -> apps/ucb-gui/target"
+
+      # The GUI's tauri.conf.json declares the `ucb` sidecar (externalBin), so a
+      # build needs it staged. Build the daemon and stage it for the host triple.
+      - name: Build ucb daemon + stage sidecar
+        run: |
+          cargo build -p ucb-daemon
+          mkdir -p apps/ucb-gui/binaries
+          cp target/debug/ucb "apps/ucb-gui/binaries/ucb-$(rustc -vV | sed -n 's/^host: //p')"
+
+      - name: GUI clippy (deny warnings)
+        working-directory: apps/ucb-gui
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: GUI test
+        working-directory: apps/ucb-gui
+        run: cargo test
+
+      - name: GUI build
+        working-directory: apps/ucb-gui
+        run: cargo build

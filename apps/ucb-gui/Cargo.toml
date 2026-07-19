@@ -23,6 +23,10 @@ tauri-build = { version = "2", features = [] }
 # Tray icon support (UX-2 tray shell). No extra features are needed for a plain
 # window + tray app; webview uses the OS engine (WKWebView on macOS).
 tauri = { version = "2", features = ["tray-icon"] }
+# REL-1 auto-updater: checks the GitHub-releases `latest.json`, verifies the
+# minisign signature against the pubkey in tauri.conf.json, downloads + installs.
+# Desktop-only plugin; this GUI is desktop-only.
+tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "sync"] }

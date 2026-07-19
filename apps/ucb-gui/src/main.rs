@@ -452,26 +452,39 @@ fn is_sensitive(text: String) -> bool {
 struct ManagedDaemon(std::sync::Mutex<Option<std::process::Child>>);
 
 /// Locate the `ucb` daemon binary. Search order (documented in the README):
-/// 1. `UCB_BIN` env var (explicit override),
-/// 2. the same directory as this GUI executable (installed side-by-side),
+/// 1. **Bundled sidecar** — in a packaged app the Tauri bundler copies the
+///    `externalBin` (`ucb-<target-triple>`) next to the GUI executable with the
+///    triple suffix stripped (`.../Contents/MacOS/ucb`, `.../ucb.exe`, …). This
+///    wins in a real install so we never fall back to `PATH`.
+/// 2. `UCB_BIN` env var (explicit override, dev),
 /// 3. a `target/{release,debug}/ucb` above the executable (dev checkout),
 /// 4. bare `ucb` on `PATH` (last resort).
+///
+/// In a dev checkout step 1 finds nothing — the GUI's own `target/` dir has no
+/// `ucb` next to `ucb-gui` (the daemon builds into the *root* workspace target) —
+/// so the dev fallbacks apply exactly as before.
 fn locate_ucb() -> PathBuf {
     let bin_name = if cfg!(windows) { "ucb.exe" } else { "ucb" };
 
-    if let Ok(p) = std::env::var("UCB_BIN") {
-        let pb = PathBuf::from(p);
-        if pb.exists() {
-            return pb;
-        }
-    }
+    // 1. Bundled sidecar: next to the GUI executable.
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             let side = dir.join(bin_name);
             if side.exists() {
                 return side;
             }
-            // Dev checkout: walk up looking for target/{release,debug}/ucb.
+        }
+    }
+    // 2. Explicit override (dev).
+    if let Ok(p) = std::env::var("UCB_BIN") {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return pb;
+        }
+    }
+    // 3. Dev checkout: walk up looking for target/{release,debug}/ucb.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
             let mut cur = Some(dir);
             while let Some(d) = cur {
                 for profile in ["release", "debug"] {
@@ -484,7 +497,8 @@ fn locate_ucb() -> PathBuf {
             }
         }
     }
-    PathBuf::from(bin_name) // resolved via PATH at spawn time
+    // 4. Resolved via PATH at spawn time.
+    PathBuf::from(bin_name)
 }
 
 /// The config directory the GUI (and any daemon it spawns) uses, mirroring the
@@ -676,10 +690,74 @@ async fn reveal_in_folder(path: String) -> Result<(), String> {
     Ok(())
 }
 
+// --- auto-updater (REL-1) --------------------------------------------------
+
+/// Holds a downloaded-but-not-yet-installed [`tauri_plugin_updater::Update`] so
+/// `check_for_update` can return the version to the UI and a later
+/// `install_update` (the toast's Install button) can act on the same handle.
+#[derive(Default)]
+struct PendingUpdate(tokio::sync::Mutex<Option<tauri_plugin_updater::Update>>);
+
+/// Check the configured GitHub-releases `latest.json` for a newer version.
+///
+/// Returns `{ available: true, version, notes }` when an update exists (and
+/// stashes the handle for `install_update`), or `{ available: false }` when the
+/// app is current. Errors (offline, bad manifest, signature mismatch) surface as
+/// a `Result::Err` so the caller can stay silent on an auto-check but show the
+/// reason on a manual check.
+#[tauri::command]
+async fn check_for_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<serde_json::Value, String> {
+    use tauri_plugin_updater::UpdaterExt;
+    let updater = app.updater().map_err(|e| e.to_string())?;
+    match updater.check().await.map_err(|e| e.to_string())? {
+        Some(update) => {
+            let version = update.version.clone();
+            let notes = update.body.clone();
+            *pending.0.lock().await = Some(update);
+            Ok(serde_json::json!({
+                "available": true,
+                "version": version,
+                "notes": notes,
+            }))
+        }
+        None => {
+            *pending.0.lock().await = None;
+            Ok(serde_json::json!({ "available": false }))
+        }
+    }
+}
+
+/// Download + install the update stashed by the last successful
+/// `check_for_update`, then relaunch into the new version. The download is
+/// verified against the updater public key in `tauri.conf.json` before install.
+#[tauri::command]
+async fn install_update(
+    app: tauri::AppHandle,
+    pending: tauri::State<'_, PendingUpdate>,
+) -> Result<(), String> {
+    let update = pending
+        .0
+        .lock()
+        .await
+        .take()
+        .ok_or("no update is pending — run a check first")?;
+    update
+        .download_and_install(|_downloaded, _total| {}, || {})
+        .await
+        .map_err(|e| e.to_string())?;
+    // Relaunch into the freshly installed version. `restart` does not return.
+    app.restart();
+}
+
 fn main() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(PairState::default())
         .manage(ManagedDaemon::default())
+        .manage(PendingUpdate::default())
         .setup(|app| {
             // Tray menu: Open, a status line (UX-2 sync indicator via polling),
             // and Quit.
@@ -777,6 +855,8 @@ fn main() {
             daemon_stop,
             daemon_restart,
             reveal_in_folder,
+            check_for_update,
+            install_update,
         ])
         .build(tauri::generate_context!())
         .expect("error while building the Universal Clipboard GUI");
