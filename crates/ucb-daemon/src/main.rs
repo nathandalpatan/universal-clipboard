@@ -34,7 +34,7 @@ use clap::{Parser, Subcommand};
 
 use ucb_clipboard::{ArboardClipboard, ClipboardService};
 use ucb_core::{DeviceInfo, Platform, PROTOCOL_VERSION};
-use ucb_crypto::Identity;
+use ucb_crypto::{migrate_identity, FileKeyStore, Identity, KeyringStore};
 use ucb_discovery::{Advertisement, Discovery};
 use ucb_history::{History, HistoryEntry, HistoryQuery};
 use ucb_sync::{pair_dial, pair_listen, Allowlist, EngineConfig, SyncEngine};
@@ -327,6 +327,22 @@ EXAMPLES:
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Choose where the device key is stored, keeping the same identity (SEC-1).
+    ///
+    /// The default `keyring` backend uses the OS keychain, which on macOS can
+    /// prompt for your login password on every access (Windows' credential
+    /// store does not). Switch to `file` to store the key in a 0600 file under
+    /// the config dir instead — no prompts. Your device id and existing
+    /// pairings are preserved either way.
+    #[command(after_help = "\
+EXAMPLES:
+  ucb keystore show          which backend is in use
+  ucb keystore use-file      stop the macOS keychain prompts (0600 file)
+  ucb keystore use-keyring   move the key back into the OS keychain")]
+    Keystore {
+        #[command(subcommand)]
+        action: KeystoreAction,
+    },
     /// Run the sync daemon until Ctrl-C.
     ///
     /// Starts clipboard polling, mDNS discovery, the sync transport, encrypted
@@ -422,6 +438,18 @@ enum ConfigAction {
     },
     /// Print the current configuration as JSON.
     Show,
+}
+
+#[derive(Subcommand)]
+enum KeystoreAction {
+    /// Show which key-store backend is currently configured.
+    Show,
+    /// Store the device key in a 0600 file under the config dir (no keychain
+    /// prompts). Migrates the existing key so the device id is unchanged.
+    UseFile,
+    /// Store the device key in the OS keychain. Migrates the existing key so
+    /// the device id is unchanged.
+    UseKeyring,
 }
 
 #[derive(Subcommand)]
@@ -525,6 +553,7 @@ async fn main() -> Result<()> {
         Command::Revoke { prefix, forget } => cmd_revoke(&paths, prefix, forget),
         Command::Peer { action } => cmd_peer(&paths, action),
         Command::Config { action } => cmd_config(&paths, action),
+        Command::Keystore { action } => cmd_keystore(&paths, action),
         Command::Run {
             poll_ms,
             headless_dir,
@@ -923,6 +952,59 @@ fn cmd_config(paths: &Paths, action: ConfigAction) -> Result<()> {
     }
 }
 
+fn cmd_keystore(paths: &Paths, action: KeystoreAction) -> Result<()> {
+    let mut config = Config::load(paths)?;
+    match action {
+        KeystoreAction::Show => {
+            println!("keystore = {:?}", config.keystore);
+            if matches!(config.keystore, Keystore::File) {
+                println!("  key file: {}", paths.keys_dir.join("static-identity").display());
+            }
+            Ok(())
+        }
+        KeystoreAction::UseFile => {
+            if matches!(config.keystore, Keystore::File) {
+                println!("Already using the file keystore.");
+                return Ok(());
+            }
+            // Copy the key out of the current (keyring) store into the file
+            // store, preserving the exact bytes so the device id is unchanged.
+            let current = build_keystore(&config, paths);
+            let target = FileKeyStore::new(paths.keys_dir.clone());
+            if !migrate_identity(current.as_ref(), &target)
+                .context("copying the device key into the file keystore")?
+            {
+                anyhow::bail!("no device identity found to migrate; run `ucb init` first");
+            }
+            config.keystore = Keystore::File;
+            config.save(paths)?;
+            println!(
+                "Switched to the file keystore — the macOS keychain will no longer prompt.\n\
+                 Key file: {} (0600). Restart `ucb run` (or the app) for it to take effect.",
+                paths.keys_dir.join("static-identity").display()
+            );
+            Ok(())
+        }
+        KeystoreAction::UseKeyring => {
+            if matches!(config.keystore, Keystore::Keyring) {
+                println!("Already using the keyring (OS keychain) keystore.");
+                return Ok(());
+            }
+            let current = build_keystore(&config, paths);
+            let target = KeyringStore::new();
+            if !migrate_identity(current.as_ref(), &target)
+                .context("copying the device key into the OS keychain")?
+            {
+                anyhow::bail!("no device identity found to migrate; run `ucb init` first");
+            }
+            config.keystore = Keystore::Keyring;
+            config.save(paths)?;
+            println!("Switched to the OS keychain keystore. Restart `ucb run` for it to take effect.");
+            Ok(())
+        }
+    }
+}
+
 fn cmd_peer(paths: &Paths, action: PeerAction) -> Result<()> {
     match action {
         PeerAction::Add { addr } => {
@@ -1030,7 +1112,7 @@ async fn cmd_run(paths: &Paths, poll_ms: u64, headless_dir: Option<PathBuf>) -> 
 
     let engine = SyncEngine::start(
         EngineConfig {
-            identity,
+            identity: identity.clone(),
             allowlist_path: paths.trusted_file.clone(),
             device_name: config.name.clone(),
             platform: Platform::current(),
@@ -1057,10 +1139,10 @@ async fn cmd_run(paths: &Paths, poll_ms: u64, headless_dir: Option<PathBuf>) -> 
         engine.clone(),
         history.clone(),
         paths.clone(),
-        Arc::new(
-            Identity::load_or_generate(store.as_ref())
-                .context("reloading identity for the IPC pairing handler")?,
-        ),
+        // Reuse the identity already loaded above. A second key-store read here
+        // means a second macOS Keychain access, which can block on an
+        // authorization prompt and hang startup before the IPC socket binds.
+        Arc::new(identity),
         config.name.clone(),
         Platform::current(),
         config.listen_port,
