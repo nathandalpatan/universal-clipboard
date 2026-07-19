@@ -6,10 +6,47 @@ existing unix-socket IPC (`<config-dir>/daemon.sock`, newline-delimited JSON)
 and relays commands. The daemon stays the single engine process.
 
 Tickets covered: **HIST-3** (history GUI), **UX-2** (devices + pair CTA),
-**PAIR-2** (on-screen QR pairing), **UX-3** groundwork (350 ms spinner
-threshold), and the history-protection trio **HIST-5** (biometric gate),
+**PAIR-2** (on-screen QR pairing), **UX-3/UX-4** (spinner threshold, transfer
+progress, toasts), the history-protection trio **HIST-5** (biometric gate),
 **HIST-6** (sensitive-content blur), **HIST-7** (screenshot/recording
-exclusion).
+exclusion), and the **Wave-4 "front door"**: a first-run onboarding wizard,
+one-click nearby-device pairing (live trust, no restart), and managed-daemon
+start/stop.
+
+## The front door (Wave 4)
+
+The GUI is meant to be the *only* thing a user touches — install, pair, sync,
+no CLI. It still speaks to the daemon over the unix socket, but it can also
+**set up and manage the daemon for you**:
+
+- **First-run onboarding.** If the socket is absent, an overlay offers to set up
+  this device: it locates the `ucb` binary, runs `ucb init` if `config.json` is
+  missing, then starts syncing. "Keep syncing in the background" installs a login
+  service (`ucb service install --activate`); otherwise the GUI spawns a
+  **managed** `ucb run` child that it kills when the app quits.
+- **Binary search order** (documented, used by onboarding + `ucb_binary_path`):
+  `UCB_BIN` → next to the GUI executable → `target/{release,debug}/ucb` above the
+  executable (dev checkout) → bare `ucb` on `PATH`.
+- **Header sync control.** A status dot + "Sync on · N/M connected" label and a
+  **Start/Stop sync** button (Stop only shown for a GUI-managed daemon; a
+  background-service daemon is left alone).
+- **One-click pairing.** The Devices view's **Nearby devices** section lists
+  discovered-but-unpaired peers (`discovered`, polled every 3 s). **Pair** dials
+  the peer's pairing port (its advertised sync port + 1) via `pair_connect` and
+  opens a modal with the 6-digit code + Confirm/Reject. **Show pairing code** runs
+  `pair_listen_start` (URI + QR + code) in the same modal, and **Add by address**
+  handles cross-subnet peers. After confirmation the peer is paired *and*
+  connected within seconds — no restart — thanks to live `trust_peer`, with a
+  success toast.
+- **Transfers + toasts.** The GUI subscribes to `transfers_subscribe` (reconnects
+  on drop). Active transfers show a progress bar (percent from chunk counts, file
+  name, direction ↑/↓, smoothed speed) that only appears past 350 ms; completion
+  and failure raise toasts; a received-file toast has a **Show in folder** action
+  (`reveal_in_folder`); a "synced N clips while away" toast fires when more than 3
+  clips land within 5 s of a peer connecting.
+- **Settings.** Automatic-file-sync toggle + max-file-size input (MiB, written as
+  bytes via `config_set`), with a restart-required banner and a one-click
+  **Restart sync** (only for a GUI-managed daemon).
 
 ## How to run
 
@@ -119,11 +156,15 @@ All are newline-delimited JSON on the daemon socket (see
 `crates/ucb-daemon/src/ipc.rs`):
 
 `status`, `history_list`, `history_star`, `history_delete`, `config_get`,
-`config_set`, `revoke`, `pair_listen_start` + `pair_confirm`.
+`config_set` (now also `max_auto_file_bytes`), `revoke`, `discovered`,
+`pair_listen_start` + `pair_confirm`, `pair_connect`, `transfers_subscribe`.
 
-## Local tauri commands (no daemon)
+The pairing and transfer commands are streamed over a persistent connection and
+surfaced to the frontend as `pair://event` and `transfer://event` events.
 
-These run entirely inside the GUI process (they do not touch the daemon socket):
+## Local tauri commands (no daemon socket)
+
+These run inside the GUI process:
 
 - `platform_capabilities() -> { os, capture_protection, biometrics }` — what
   this platform+device can enforce, so the frontend never shows a fake lock or a
@@ -133,17 +174,33 @@ These run entirely inside the GUI process (they do not touch the daemon socket):
   prompt (macOS only; `supported: false` elsewhere).
 - `is_sensitive(text) -> bool` and `is_sensitive_batch(texts) -> [bool]` —
   HIST-6 classification (heuristics in `src/sensitive.rs`).
+- `ucb_binary_path()`, `ucb_is_initialized()`, `daemon_is_managed()` — onboarding
+  probes.
+- `onboard(name, keep_background)` — first-run setup (init if needed, then start
+  syncing as a managed child or a background service).
+- `daemon_start()` / `daemon_stop()` / `daemon_restart()` — manage the GUI-owned
+  `ucb run` child.
+- `reveal_in_folder(path)` — "Show in folder" (shells out to
+  `open -R` / `explorer /select,` / `xdg-open`; no Tauri plugin required).
 
 ## Not done yet (future work)
 
-- **REL-1**: bundling, code-signing, and the auto-updater. Right now this is
-  `cargo run` only; no `.app`/`.dmg`/`.deb` packaging and no updater are wired.
-  The `bundle` section in `tauri.conf.json` and the placeholder `icons/` exist
-  as a starting point, but real icon assets and signing config are still needed.
-- **UX-3 completion**: only the spinner threshold is in place. Toast
-  notifications, richer error surfacing, and optimistic updates remain.
+- **REL-1 (packaging wave)**: bundling, code-signing, and the auto-updater. Right
+  now this is `cargo run` only; no `.app`/`.dmg`/`.deb` packaging and no updater
+  are wired. The `bundle` section in `tauri.conf.json` and the placeholder
+  `icons/` exist as a starting point, but real icon assets and signing config are
+  still needed. **Binary-location assumption to revisit:** onboarding locates
+  `ucb` next to the GUI executable or in a dev `target/` dir; a real installer
+  should ship `ucb` as a Tauri **sidecar** and have the GUI resolve the sidecar
+  path instead of searching, removing the PATH fallback.
 - **Windows/named-pipe client**: the IPC client is unix-socket only; on Windows
   the commands return an "unsupported" error (the daemon speaks named pipes
   there — a small client addition would close this).
-- `config_set` changes (e.g. `auto_file_sync`) require a daemon restart to take
-  effect; the reply reports `restart_required: true`. Hot-reload is future work.
+- `config_set` changes require a daemon restart to take effect; the reply reports
+  `restart_required: true`, and the Settings **Restart sync** button applies it
+  in one click for a GUI-managed daemon. Hot-reload is still future work.
+- **Nearby "Pair" requires the peer to be listening**: one-click pairing dials the
+  peer's pairing port, so the other device must have "Show pairing code" (or
+  `ucb pair --listen`) active. A future rendezvous/notify step could remove this.
+- **Discovered peers carry no platform**: mDNS TXT records don't include the OS,
+  so the Nearby list shows name + IP (not platform).

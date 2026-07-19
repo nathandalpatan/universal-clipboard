@@ -145,6 +145,71 @@ Never sideways or upward.
   sizes, chunk counts, and paths only, never file contents (SEC-2). Neither
   changes `PeerStatus`/`status()`.
 
+## Wave 4 (build/expansion) — the GUI as the complete front door
+
+Goal: a user installs, pairs, and syncs entirely from the desktop GUI, never
+touching the CLI. The daemon stays the single engine process; the GUI is a thin
+unix-socket frontend.
+
+- **Live trust (kills the restart-after-pairing papercut):**
+  `SyncEngine::trust_peer(device: DeviceInfo, static_pubkey) -> Result<()>` adds a
+  peer to the running engine's allowlist (reloading `trusted.json` from disk so it
+  stays coherent with the pairing flow's write; honoring MAX_DEVICES + tombstones)
+  and, if discovery already knows the peer's endpoint, **eagerly dials it** so a
+  session forms with no daemon restart. The eager dial ignores the id-ordering
+  rule for its one dial.
+- **Simultaneous-open tiebreak (new invariant):** because the eager dial (and the
+  peer's own dial) can open two TCP connections at once, `run_session` now keeps
+  exactly one connection per peer, chosen deterministically: the *canonical*
+  connection is the one dialed by the numerically smaller `DeviceId`. Both ends
+  compute this identically (`(self_id < peer_id) == dialed`), so a simultaneous
+  open never collapses the live session — only a canonical connection may evict a
+  non-canonical duplicate; any other duplicate is dropped. Normal (id-ordered)
+  dialing is unaffected.
+- **Fixed pairing port:** GUI-initiated pairing binds `listen_port + 1` (default
+  **48522**) so a peer can dial it knowing only the IP; falls back to an ephemeral
+  port if taken (the streamed `pairing` URI carries the actual port either way).
+  `ucb pair --listen` is unchanged. On a successful `pair_listen_start` **or**
+  `pair_connect`, the daemon calls `trust_peer` so sync starts immediately.
+- **New IPC commands** (newline-JSON, same conventions):
+  - `{"cmd":"discovered"}` → `{"peers":[{id_short,id,name,addrs,port,trusted,connected}]}`
+    from `SyncEngine::discovered()`.
+  - `{"cmd":"pair_connect","addr":"ip:port|ucb://…"}` → streams a `code` line,
+    waits for `{"cmd":"pair_confirm","accept":bool}` on the same connection, then a
+    `result` line; on success writes the allowlist AND `trust_peer`s live. Shares
+    the one-pairing-at-a-time slot with `pair_listen_start`.
+  - `{"cmd":"transfers_subscribe"}` → long-lived stream of serde-tagged
+    `TransferEvent` JSON lines (`recv_started`/`recv_progress`/`recv_completed`/
+    `send_progress`/`send_completed`), device ids as short+full, path as string,
+    never file contents (SEC-2). Stays open until the client disconnects.
+  - `config_set` extended with `max_auto_file_bytes` (u64) alongside
+    `auto_file_sync`.
+- **IPC test determinism:** the daemon test harness now retries the socket connect
+  (5×100ms) and re-sends on an EOF-before-first-line, removing the known
+  parallel-load flake (`config_ipc_commands`, named cases).
+- **GUI (`apps/ucb-gui`, standalone Tauri v2 project):**
+  - **Onboarding wizard (first run):** when the socket is absent, the GUI offers to
+    set everything up — locates the `ucb` binary (`UCB_BIN` → next to the GUI exe →
+    `target/{release,debug}/ucb` above it → PATH), runs `ucb init --name <name>` if
+    `config.json` is missing, then either spawns a **managed** `ucb run` child
+    (killed on GUI quit) or, with "Keep syncing in background", runs
+    `ucb service install --activate`. Header shows a status dot + Start/Stop sync.
+  - **One-click pairing:** the Devices view lists **Nearby devices** (`discovered`,
+    polled 3s); an unpaired peer's **Pair** button dials `ip:(advertised_port+1)`
+    via `pair_connect` and opens a modal with the 6-digit code + Confirm/Reject.
+    **Show pairing code** runs `pair_listen_start` (URI + QR + code) in the same
+    modal; **Add by address** covers cross-subnet. After success the peer appears
+    paired & connected within seconds (live `trust_peer`) with a success toast.
+  - **Transfers + toasts:** subscribes to `transfers_subscribe` (reconnects on
+    drop); active transfers render progress bars (percent from chunk counts, name,
+    direction, smoothed speed) shown only past 350ms; completion/failure toasts; a
+    received-file toast has **Show in folder** (`reveal_in_folder`, no plugin —
+    shells out to `open -R`/`explorer /select`/`xdg-open`); a "synced N clips while
+    away" toast fires when >3 clips land within 5s of a peer connecting.
+  - **Settings:** auto-file-sync toggle + max-file-size input (MiB → bytes via
+    `config_set`) with a restart-required banner and one-click **Restart sync**
+    (GUI-managed daemon only); the HIST-5/6/7 protections are unchanged.
+
 ## Conventions
 
 - Async: tokio. Errors: `thiserror` in libs, `anyhow` in the daemon.

@@ -1063,6 +1063,7 @@ async fn cmd_run(paths: &Paths, poll_ms: u64, headless_dir: Option<PathBuf>) -> 
         ),
         config.name.clone(),
         Platform::current(),
+        config.listen_port,
     ));
     let ipc_task = match ipc::bind(&paths.socket_file) {
         Ok(listener) => {
