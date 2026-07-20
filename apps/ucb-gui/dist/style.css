@@ -103,6 +103,27 @@ code {
   padding: 1px 6px; border-radius: 5px;
 }
 
+/* ---- live status panel: the reference image's bottom spec-card ------------- */
+.statpanel {
+  background: var(--inset); border: 1px solid var(--hair); border-radius: 10px;
+  padding: 4px 16px; margin: 0 0 18px;
+}
+.stat-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hair);
+}
+.stat-row:last-child { border-bottom: 0; }
+.stat-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.12em;
+  color: var(--muted); white-space: nowrap;
+}
+.stat-value {
+  font-size: 12px; text-align: right; min-width: 0;
+  display: flex; align-items: center; gap: 8px; justify-content: flex-end;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
 .section-title {
   font-size: 10px; text-transform: uppercase; letter-spacing: 0.14em;
   color: var(--muted); margin: 26px 0 2px;
