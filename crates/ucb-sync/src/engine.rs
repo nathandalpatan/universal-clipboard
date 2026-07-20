@@ -51,6 +51,7 @@ use ucb_history::History;
 
 use crate::allowlist::Allowlist;
 use crate::error::{Error, Result};
+use crate::incoming::{IncomingAttempt, IncomingAttempts, MAX_INCOMING_ATTEMPTS};
 use crate::now_ms;
 use crate::queue::OfflineQueue;
 use crate::rate_limit::TokenBucketLimiter;
@@ -239,6 +240,10 @@ struct Shared {
     /// `PeerLost` to stop the connector.
     connectors: Mutex<HashMap<DeviceId, Arc<AtomicBool>>>,
     rate: Mutex<TokenBucketLimiter>,
+    /// NAT-60: bounded, recent log of *rejected* untrusted inbound attempts, so
+    /// the GUI can show who tried to reach this device. Purely informational —
+    /// nothing here grants trust or accepts a peer.
+    incoming: Mutex<IncomingAttempts>,
     token_ctr: AtomicU64,
     /// HIST-1/2/3: optional encrypted history store.
     history: Option<Arc<History>>,
@@ -299,6 +304,7 @@ impl SyncEngine {
             peers: Mutex::new(HashMap::new()),
             connectors: Mutex::new(HashMap::new()),
             rate: Mutex::new(TokenBucketLimiter::per_minute_5()),
+            incoming: Mutex::new(IncomingAttempts::new(MAX_INCOMING_ATTEMPTS)),
             token_ctr: AtomicU64::new(0),
             history: config.history,
             received_dir: config.received_dir,
@@ -380,6 +386,14 @@ impl SyncEngine {
                 connected: connected.contains(&id),
             })
             .collect()
+    }
+
+    /// A snapshot of the recent *rejected* untrusted inbound attempts (NAT-60),
+    /// most-recent first — the additive read surface behind the GUI's "incoming
+    /// requests" panel. Mirrors [`discovered`](Self::discovered): read-only, and
+    /// listing an attempt here confers no trust (the peer was turned away).
+    pub fn incoming(&self) -> Vec<IncomingAttempt> {
+        self.shared.incoming.lock().unwrap().snapshot()
     }
 
     /// Subscribe to file-transfer lifecycle events (GUI surface). Each call
@@ -641,7 +655,7 @@ impl Shared {
                     }
                     let me = self.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = me.serve_inbound(stream).await {
+                        if let Err(e) = me.serve_inbound(stream, addr.ip()).await {
                             tracing::debug!(error = %e, "inbound connection ended");
                         }
                     });
@@ -654,7 +668,7 @@ impl Shared {
         }
     }
 
-    async fn serve_inbound<S>(self: Arc<Self>, stream: S) -> Result<()>
+    async fn serve_inbound<S>(self: Arc<Self>, stream: S, peer_ip: IpAddr) -> Result<()>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
@@ -662,6 +676,18 @@ impl Shared {
         let remote_id = chan.remote_device_id();
 
         if !self.is_trusted(&remote_id, chan.remote_static_pubkey()) {
+            // NAT-60: remember this rejected attempt so the GUI can show who is
+            // trying to reach this device and offer to pair — without granting
+            // any trust, accepting the peer, or reading data from it. The peer
+            // sends no application `Hello` before rejection, so any name shown
+            // comes from discovery (mDNS), never the untrusted peer's own claim.
+            let name = self
+                .peers
+                .lock()
+                .unwrap()
+                .get(&remote_id)
+                .map(|ep| ep.name.clone());
+            self.incoming.lock().unwrap().record(remote_id, name, peer_ip);
             tracing::warn!(peer = %remote_id.short(), "rejecting untrusted inbound peer");
             return Ok(()); // drop the connection
         }

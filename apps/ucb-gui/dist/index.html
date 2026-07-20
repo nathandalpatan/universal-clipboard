@@ -59,9 +59,19 @@
           </div>
         </div>
         <p class="muted hint">
-          Turn on sync (top bar) to discover nearby devices. Pair a device once to
-          trust it — after that, anything you copy is shared with it automatically.
+          Turn on sync (top bar) to discover nearby devices. Pairing is mutual:
+          one device shows a 6-digit code, the other confirms it — after that,
+          anything you copy is shared between them automatically.
         </p>
+
+        <!-- Incoming requests (NAT-60): unpaired devices that tried to reach
+             this one. Live/informational — it grants no trust on its own, and
+             pairing still needs explicit consent + a matching code on both
+             sides. Hidden unless there is something pending. -->
+        <div id="incoming-wrap" hidden>
+          <h2 class="section-title">Incoming requests</h2>
+          <div id="incoming-body"></div>
+        </div>
 
         <h2 class="section-title">Paired devices</h2>
         <div id="devices-body"></div>
@@ -167,11 +177,15 @@
         <h2 id="pair-modal-title">Pair a device</h2>
 
         <div id="pair-listen-info" hidden>
-          <p class="muted">
-            On your other computer, install <code>ucb</code> and either scan this
-            QR or run <code>ucb pair --connect &lt;address&gt;</code>. Confirm the
-            6-digit code matches on both screens.
-          </p>
+          <ol class="pair-steps muted">
+            <li>On your other device, open Universal Clipboard (or install
+              <code>ucb</code>).</li>
+            <li>There, pick this device under <strong>Nearby devices</strong> and
+              click <strong>Pair</strong> — or scan the QR / run
+              <code>ucb pair --connect &lt;address&gt;</code>.</li>
+            <li>Check the 6-digit code matches on both screens, then confirm on
+              each.</li>
+          </ol>
           <label class="fieldlabel">Pairing address</label>
           <div class="uri-row">
             <code id="pair-uri"></code>

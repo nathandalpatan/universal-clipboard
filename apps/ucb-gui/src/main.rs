@@ -156,6 +156,14 @@ async fn ipc_discovered() -> Result<serde_json::Value, String> {
     send_request(r#"{"cmd":"discovered"}"#.to_string()).await
 }
 
+/// Recent *rejected* untrusted inbound attempts (NAT-60) — the "incoming
+/// requests" panel. Informational only: this grants no trust, it just shows who
+/// tried to reach this device so the user can choose to pair.
+#[tauri::command]
+async fn ipc_incoming() -> Result<serde_json::Value, String> {
+    send_request(r#"{"cmd":"incoming"}"#.to_string()).await
+}
+
 // --- pairing (streaming over one persistent connection) --------------------
 
 /// Begin an on-screen pairing session. Opens a dedicated connection, reads the
@@ -837,6 +845,7 @@ fn main() {
             ipc_config_set,
             ipc_revoke,
             ipc_discovered,
+            ipc_incoming,
             pair_start,
             pair_confirm,
             pair_cancel,

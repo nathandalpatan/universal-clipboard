@@ -12,6 +12,7 @@
 mod allowlist;
 mod engine;
 mod error;
+mod incoming;
 mod pairing;
 mod queue;
 mod rate_limit;
@@ -21,6 +22,7 @@ pub use engine::{
     DiscoveredPeer, EngineConfig, PeerStatus, SendProgress, SendReport, SyncEngine, TransferEvent,
     DEFAULT_MAX_AUTO_FILE_BYTES,
 };
+pub use incoming::IncomingAttempt;
 pub use error::{Error, Result};
 pub use pairing::{pair_dial, pair_listen, ConfirmPairing};
 pub use queue::{OfflineQueue, QUEUE_CAP, QUEUE_MAX_AGE_MS};

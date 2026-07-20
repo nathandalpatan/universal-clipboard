@@ -310,6 +310,20 @@ input[type="checkbox"] { accent-color: var(--ink); }
 .addr-add input { flex: 1; }
 .platform-tag { font-size: 10px; color: var(--muted); margin-left: 6px; }
 
+/* ---- incoming requests (NAT-60) --------------------------------------------- */
+/* A hairline ink accent draws the eye to a live, time-sensitive row without
+   introducing color (monochrome system) or motion on a frequently-polled list. */
+#incoming-wrap { margin-bottom: 4px; }
+.rowitem.incoming { border-left: 2px solid var(--ink); padding-left: 10px; }
+
+/* ---- pairing walkthrough steps ---------------------------------------------- */
+.pair-steps {
+  margin: 0 0 8px; padding-left: 20px;
+  font-size: 11px; line-height: 1.6;
+}
+.pair-steps li { margin: 4px 0; }
+.pair-steps strong { color: var(--ink); font-weight: 400; }
+
 /* ---- modal ------------------------------------------------------------------ */
 /* Modals keep transform-origin: center (not trigger-anchored) per the skill. */
 .modal-backdrop {
