@@ -120,6 +120,23 @@ pub fn migrate_identity(from: &dyn KeyStore, to: &dyn KeyStore) -> Result<bool> 
     }
 }
 
+/// Copy an arbitrary named secret verbatim from one key store to another,
+/// used when switching keystore backends to carry across every secret (not
+/// just the device identity — e.g. the encrypted-history database key), so no
+/// data becomes undecryptable and no orphan is stranded in the old backend.
+///
+/// Returns `Ok(true)` if `name` existed in `from` and was written to `to`, or
+/// `Ok(false)` if `from` held no such secret. The bytes are copied as-is.
+pub fn migrate_secret(from: &dyn KeyStore, to: &dyn KeyStore, name: &str) -> Result<bool> {
+    match from.get(name)? {
+        Some(blob) => {
+            to.set(name, &blob)?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
 impl fmt::Debug for Identity {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // SEC-2: never expose the private key. Only id + public key are shown.
