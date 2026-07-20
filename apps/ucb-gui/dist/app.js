@@ -455,6 +455,11 @@ $("#onboard-startbtn").addEventListener("click", async () => {
 // --- Devices (UX-2) --------------------------------------------------------
 
 let lastPeers = [];
+let lastDiscovered = []; // last "nearby" snapshot, so incoming rows can find a
+// peer's pairing port when the user clicks Pair.
+// NAT-60: incoming attempts the user dismissed, keyed by full device id → the
+// `last_seen_ms` at dismissal. A newer attempt from the same device re-surfaces.
+const dismissedIncoming = new Map();
 
 async function refreshDevices() {
   const body = $("#devices-body");
@@ -516,6 +521,7 @@ async function refreshDevices() {
   }
 
   await refreshNearby();
+  await refreshIncoming();
 }
 
 // Nearby devices: discovered but not yet paired.
@@ -528,6 +534,7 @@ async function refreshNearby() {
   } catch {
     discovered = [];
   }
+  lastDiscovered = discovered;
 
   const unpaired = discovered.filter((p) => !p.trusted);
   nearby.innerHTML = "";
@@ -540,10 +547,11 @@ async function refreshNearby() {
 
   for (const p of unpaired) {
     const row = el("div", "rowitem");
+    row.appendChild(el("span", "badge", "nearby"));
     const grow = el("div", "grow");
     grow.appendChild(el("div", "name", p.name || "(unnamed)"));
     const ip = (p.addrs && p.addrs[0]) || "?";
-    grow.appendChild(el("div", "sub", `${ip} · ${p.id_short}`));
+    grow.appendChild(el("div", "sub", `${ip} · ${p.id_short} · discovered, not paired`));
     row.appendChild(grow);
     const btn = el("button", "btn small primary", "Pair");
     btn.addEventListener("click", () => {
@@ -554,6 +562,77 @@ async function refreshNearby() {
     });
     row.appendChild(btn);
     nearby.appendChild(row);
+  }
+}
+
+// Incoming requests (NAT-60): devices that tried to connect but aren't paired.
+// This is a read-only, informational surface — showing an entry grants no trust
+// (the daemon already rejected the connection). "Pair" routes into the normal
+// mutual, code-confirmed pairing flow; "Dismiss" hides it until it retries.
+async function refreshIncoming() {
+  const wrap = $("#incoming-wrap");
+  const body = $("#incoming-body");
+  let attempts = [];
+  try {
+    const res = await invoke("ipc_incoming");
+    attempts = (res && res.attempts) || [];
+  } catch {
+    attempts = [];
+  }
+
+  // Drop anything already paired (it belongs in "Paired devices" now) or
+  // dismissed — unless a *newer* attempt has arrived since the dismissal.
+  const pairedShorts = new Set(lastPeers.map((p) => p.id_short));
+  const pending = attempts.filter((a) => {
+    if (pairedShorts.has(a.id_short)) return false;
+    const dz = dismissedIncoming.get(a.id);
+    return dz == null || Number(a.last_seen_ms) > dz;
+  });
+
+  wrap.hidden = pending.length === 0;
+  body.innerHTML = "";
+  for (const a of pending) {
+    const row = el("div", "rowitem incoming");
+    row.appendChild(el("span", "badge", "not paired"));
+    const grow = el("div", "grow");
+    const who = a.name || a.id_short;
+    grow.appendChild(el("div", "name", who));
+    const ip = a.addr || "?";
+    const when =
+      Number(a.count) > 1
+        ? `${a.count}× · last ${relTime(a.last_seen_ms)}`
+        : relTime(a.first_seen_ms);
+    grow.appendChild(el("div", "sub", `${ip} tried to connect — not paired · ${when}`));
+    row.appendChild(grow);
+
+    const pair = el("button", "btn small primary", "Pair");
+    pair.addEventListener("click", () => pairFromIncoming(a));
+    row.appendChild(pair);
+
+    const dismiss = el("button", "btn small ghost", "Dismiss");
+    dismiss.addEventListener("click", () => {
+      dismissedIncoming.set(a.id, Number(a.last_seen_ms) || Date.now());
+      refreshIncoming();
+    });
+    row.appendChild(dismiss);
+    body.appendChild(row);
+  }
+}
+
+// Start pairing with a device that just tried to reach us. If discovery knows
+// where it listens, dial its pairing port directly (same as "Nearby" Pair);
+// otherwise fall back to showing our code so the mutual, code-confirmed pair can
+// still complete. Either way this is ≤2 clicks into the existing pairing modal.
+function pairFromIncoming(a) {
+  const disc = lastDiscovered.find((d) => d.id === a.id || d.id_short === a.id_short);
+  if (disc && disc.port) {
+    const ip = a.addr || (disc.addrs && disc.addrs[0]);
+    startConnectPairing(`${ip}:${Number(disc.port) + 1}`, a.name || ip);
+  } else {
+    // We don't know its pairing port — show our code and tell the user the peer
+    // needs to accept from their side.
+    startListenPairing();
+    toast(`Ask ${a.name || a.id_short} to accept the code on their device`, "ok");
   }
 }
 

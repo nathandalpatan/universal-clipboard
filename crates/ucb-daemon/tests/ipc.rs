@@ -419,6 +419,58 @@ async fn discovered_ipc_empty_ok() {
     assert!(peers.is_empty(), "no peers discovered in a headless sandbox: {v}");
 }
 
+/// `incoming` on a fresh headless daemon (nothing has tried to connect) returns
+/// a clean, empty `{"attempts":[]}` envelope — the command plumbing + shape.
+#[tokio::test]
+async fn incoming_ipc_empty_ok() {
+    let (_guard, _cfg, socket) = spawn_headless_daemon("incempty").await;
+    let v = request_one(&socket, r#"{"cmd":"incoming"}"#).await;
+    let attempts = v["attempts"].as_array().expect("attempts array");
+    assert!(attempts.is_empty(), "no attempts in a headless sandbox: {v}");
+}
+
+/// Two daemons that are NOT paired but can reach each other (static peers) each
+/// dial the other's sync port and are rejected as untrusted — and that rejected
+/// attempt surfaces in the `incoming` snapshot (NAT-60). Visibility only: the
+/// peer is never trusted, so `status` stays empty.
+#[tokio::test]
+async fn incoming_ipc_records_rejected_untrusted_attempt() {
+    let port_a = free_port();
+    let port_b = free_port();
+    let da = spawn_daemon_configured("inA", port_a, &[format!("127.0.0.1:{port_b}")]).await;
+    // Kept alive to end of scope so B keeps dialing A's sync port.
+    let _db = spawn_daemon_configured("inB", port_b, &[format!("127.0.0.1:{port_a}")]).await;
+
+    // B's static connector dials A and is rejected (not paired) — A records it.
+    // Poll until the attempt surfaces (the connector retries with backoff).
+    let mut attempts = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        let v = request_one(&da.socket, r#"{"cmd":"incoming"}"#).await;
+        attempts = v["attempts"].as_array().cloned().unwrap_or_default();
+        if !attempts.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(!attempts.is_empty(), "A must record B's rejected attempt");
+    let a0 = &attempts[0];
+    assert_eq!(a0["addr"], serde_json::json!("127.0.0.1"), "source ip: {a0}");
+    assert!(a0["count"].as_u64().unwrap_or(0) >= 1, "count present: {a0}");
+    assert!(a0["id_short"].as_str().is_some(), "id_short present: {a0}");
+    assert!(a0["id"].as_str().is_some(), "full id present: {a0}");
+    assert!(a0.get("first_seen_ms").and_then(|x| x.as_u64()).is_some(), "first_seen_ms: {a0}");
+    assert!(a0.get("last_seen_ms").and_then(|x| x.as_u64()).is_some(), "last_seen_ms: {a0}");
+
+    // Visibility grants NO trust: the rejected peer is not paired.
+    let status = request_one(&da.socket, r#"{"cmd":"status"}"#).await;
+    assert_eq!(
+        status["peers"].as_array().unwrap().len(),
+        0,
+        "inbound visibility must not trust the peer: {status}"
+    );
+}
+
 /// `config_set` accepts `max_auto_file_bytes` (alongside `auto_file_sync`) and
 /// persists it, visible to a follow-up `config_get`.
 #[tokio::test]

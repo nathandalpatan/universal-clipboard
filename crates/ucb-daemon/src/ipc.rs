@@ -92,6 +92,11 @@ pub enum Request {
     /// for the GUI's "nearby devices" list. Replies with a single `{"peers":[…]}`
     /// line from [`SyncEngine::discovered`].
     Discovered,
+    /// Snapshot the recent *rejected* untrusted inbound attempts (NAT-60), for
+    /// the GUI's "incoming requests" panel. Replies with a single
+    /// `{"attempts":[…]}` line from [`SyncEngine::incoming`]. Informational only:
+    /// listing an attempt grants no trust and moves no data.
+    Incoming,
     /// Dial a listening peer to pair with it (the GUI's one-click "Pair"). `addr`
     /// is a bare `ip:port` or a `ucb://ip:port` URI. Streams a `code` line, waits
     /// for a [`Request::PairConfirm`] on the same connection, then a `result`
@@ -343,6 +348,10 @@ where
             let resp = discovered_snapshot(&ctx.engine);
             write_line(&mut write_half, &resp).await?;
         }
+        Request::Incoming => {
+            let resp = incoming_snapshot(&ctx.engine);
+            write_line(&mut write_half, &resp).await?;
+        }
         Request::PairConnect { addr } => {
             handle_pair_connect(&ctx, &addr, &mut reader, &mut write_half).await?;
         }
@@ -424,6 +433,33 @@ fn discovered_snapshot(engine: &SyncEngine) -> serde_json::Value {
         })
         .collect();
     serde_json::json!({ "peers": peers })
+}
+
+/// Snapshot [`SyncEngine::incoming`] for the GUI's "incoming requests" panel
+/// (NAT-60). Informational only: an entry here means a peer tried to reach this
+/// device and was *rejected* for not being paired — it grants no trust and
+/// carries no clipboard or file data, only a name/ip/timing summary. The name
+/// is `null` when discovery hasn't seen the device (never the peer's own claim).
+///
+/// This is the single definition of the `incoming` reply shape; the GUI reads
+/// exactly these fields.
+fn incoming_snapshot(engine: &SyncEngine) -> serde_json::Value {
+    let attempts: Vec<serde_json::Value> = engine
+        .incoming()
+        .into_iter()
+        .map(|a| {
+            serde_json::json!({
+                "id_short": a.device_id.short(),
+                "id": a.device_id.to_string(),
+                "name": a.name,
+                "addr": a.addr.to_string(),
+                "first_seen_ms": a.first_seen_ms,
+                "last_seen_ms": a.last_seen_ms,
+                "count": a.count,
+            })
+        })
+        .collect();
+    serde_json::json!({ "attempts": attempts })
 }
 
 /// Serialize one [`TransferEvent`] as a serde-tagged JSON object for the GUI
