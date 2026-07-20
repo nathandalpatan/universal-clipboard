@@ -202,7 +202,7 @@ enum Command {
 EXAMPLES:
   ucb init                       set up with the hostname as the device name
   ucb init --name \"Work Laptop\"  choose a friendly device name
-  ucb init --file-keystore       store the key in a 0600 file (headless Linux)
+  ucb init --file-keystore       force the 0600 file store (the default on macOS)
 
 After init, run `ucb info` to see your setup or `ucb guide` for a walkthrough.")]
     Init {
@@ -574,7 +574,14 @@ fn cmd_init(
     std::fs::create_dir_all(&paths.config_dir)?;
 
     let name = name.unwrap_or_else(default_device_name);
-    let keystore = if file_keystore {
+    // Default the key store per platform. On macOS the OS Keychain prompts for
+    // the login password on every access from a binary whose code signature
+    // isn't stable (ad-hoc/unsigned dev builds, and any rebuild changes it),
+    // which blocks the daemon at startup and makes "Start sync" appear to hang.
+    // So macOS defaults to the 0600 file store; explicit `--file-keystore`
+    // forces it everywhere. Signed-release users who prefer the Keychain can
+    // opt in with `ucb keystore use-keyring`.
+    let keystore = if file_keystore || cfg!(target_os = "macos") {
         Keystore::File
     } else {
         Keystore::Keyring
