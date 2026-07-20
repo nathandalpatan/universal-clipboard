@@ -64,6 +64,7 @@ main { flex: 1; overflow: auto; padding: 16px; }
 h1 { font-size: 18px; margin: 4px 0 14px; }
 h2 { font-size: 15px; margin: 0 0 10px; }
 .muted { color: var(--muted); }
+.hint { font-size: 12px; line-height: 1.45; margin: 2px 0 12px; }
 code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; }
 
 .card {
@@ -97,6 +98,14 @@ code { background: var(--panel-2); padding: 2px 6px; border-radius: 6px; }
 .btn.small { padding: 5px 10px; font-size: 12px; }
 .btn.ghost { background: transparent; }
 .btn:disabled { opacity: .5; cursor: default; }
+/* Busy state: a small inline spinner before the label (Starting…/Stopping…). */
+.btn.busy { opacity: 1; cursor: progress; }
+.btn.busy::before {
+  content: ""; display: inline-block; width: 11px; height: 11px; margin-right: 6px;
+  vertical-align: -1px; border-radius: 50%;
+  border: 2px solid currentColor; border-top-color: transparent;
+  animation: spin .7s linear infinite;
+}
 
 .row { display: flex; gap: 8px; margin-top: 10px; }
 .center { text-align: center; margin-top: 8px; }

@@ -122,6 +122,10 @@ document.querySelectorAll(".tab").forEach((t) =>
 
 let daemonUp = false;
 let daemonManaged = false;
+// True while a Start/Stop is in flight. Holds the button in a "busy" state and
+// stops the background poll from clobbering that label before the daemon socket
+// actually comes up (or fails to), so a click always has visible feedback.
+let syncPending = false;
 
 function setDaemonDot(on) {
   const dot = $("#daemon-dot");
@@ -129,8 +133,34 @@ function setDaemonDot(on) {
   dot.classList.toggle("off", !on);
 }
 
+// Put the sync button into an immediate busy state (disabled + spinner label).
+function setSyncBusy(text) {
+  syncPending = true;
+  const btn = $("#sync-toggle");
+  const label = $("#sync-label");
+  btn.hidden = false;
+  btn.disabled = true;
+  btn.classList.add("busy");
+  btn.textContent = text;
+  if (label) label.textContent = text === "Starting…" ? "Starting sync…" : "Stopping sync…";
+}
+
+// Release the busy state so the next status refresh can set the real label.
+function clearSyncBusy() {
+  syncPending = false;
+  const btn = $("#sync-toggle");
+  btn.disabled = false;
+  btn.classList.remove("busy");
+}
+
 // Refresh the header sync label + Start/Stop button from the current state.
 async function refreshSyncControl(status) {
+  // A start/stop is mid-flight: keep the busy label until it resolves.
+  if (syncPending) {
+    daemonUp = !!status;
+    setDaemonDot(daemonUp);
+    return;
+  }
   daemonUp = !!status;
   setDaemonDot(daemonUp);
 
@@ -162,12 +192,20 @@ async function refreshSyncControl(status) {
 
 $("#sync-toggle").addEventListener("click", async () => {
   if (daemonUp && daemonManaged) {
+    // Stop: show immediate feedback, then let the socket drop before refreshing.
+    setSyncBusy("Stopping…");
     try {
       await invoke("daemon_stop");
     } catch (e) {
+      clearSyncBusy();
       toast(String(e), "err");
+      return;
     }
-    setTimeout(pollStatus, 300);
+    setTimeout(async () => {
+      clearSyncBusy();
+      await pollStatus();
+      toast("Sync stopped", "ok");
+    }, 400);
   } else if (!daemonUp) {
     // Route through onboarding if the device isn't set up yet.
     let inited = false;
@@ -178,11 +216,13 @@ $("#sync-toggle").addEventListener("click", async () => {
       openOnboard();
       return;
     }
+    setSyncBusy("Starting…");
     try {
       await invoke("daemon_start");
-      toast("Starting sync…");
     } catch (e) {
-      toast(String(e), "err");
+      clearSyncBusy();
+      toast(`Couldn't start sync: ${e}`, "err", [], 9000);
+      return;
     }
     waitForDaemon();
   }
@@ -198,7 +238,8 @@ async function pollStatus() {
   }
   await refreshSyncControl(status);
   if (!status) {
-    maybeShowOnboard();
+    // Don't pop onboarding mid-start — waitForDaemon owns that transition.
+    if (!syncPending) maybeShowOnboard();
   } else {
     hideOnboard();
     ensureTransfersStream();
@@ -207,15 +248,33 @@ async function pollStatus() {
   return status;
 }
 
-// After a start/onboarding, poll until the daemon socket comes up (or give up).
+// After a start/onboarding, poll until the daemon socket answers (or give up
+// after ~10s), then report a clear success or failure either way.
 function waitForDaemon() {
   let tries = 0;
   const iv = setInterval(async () => {
     tries++;
-    const status = await pollStatus();
+    let status = null;
+    try {
+      status = await invoke("ipc_status");
+    } catch {
+      status = null;
+    }
     if (status || tries > 20) {
       clearInterval(iv);
-      if (status) refreshDevices();
+      clearSyncBusy();
+      const s = await pollStatus();
+      if (s) {
+        refreshDevices();
+        toast("Sync is on — you can now pair a device", "ok");
+      } else {
+        toast(
+          "Couldn't start sync — the daemon didn't come up. Try again, or check that another copy isn't already running on this port.",
+          "err",
+          [],
+          9000
+        );
+      }
     }
   }, 500);
 }
