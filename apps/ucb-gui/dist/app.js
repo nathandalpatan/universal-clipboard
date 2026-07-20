@@ -42,6 +42,17 @@ function fmtTime(ms) {
   }
 }
 
+// Relative time for status feedback: "just now", "42s ago", "5m ago"…
+function relTime(ms) {
+  const d = Date.now() - Number(ms);
+  if (!Number.isFinite(d) || d < 0) return "just now";
+  if (d < 5000) return "just now";
+  if (d < 60000) return `${Math.floor(d / 1000)}s ago`;
+  if (d < 3600000) return `${Math.floor(d / 60000)}m ago`;
+  if (d < 86400000) return `${Math.floor(d / 3600000)}h ago`;
+  return new Date(Number(ms)).toLocaleDateString();
+}
+
 function fmtBytes(n) {
   n = Number(n) || 0;
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -228,7 +239,92 @@ $("#sync-toggle").addEventListener("click", async () => {
   }
 });
 
-// Poll the daemon status; drives the header, dot, and (implicitly) onboarding.
+// --- live status panel (Devices view) --------------------------------------
+// Answers "who am I, who am I connected to, and is sync actually moving data".
+
+let selfLabel = null; // cached "name · port"; reset when the daemon goes down
+let lastSyncByOrigin = {}; // origin id_short → newest history ts_ms
+
+async function ensureSelfLabel() {
+  if (selfLabel) return selfLabel;
+  try {
+    const cfg = await invoke("ipc_config_get");
+    if (cfg && cfg.name) {
+      selfLabel = `${cfg.name} · port ${cfg.listen_port}`;
+      return selfLabel;
+    }
+  } catch {}
+  return null;
+}
+
+// Pull the newest history entries and derive (a) the headline "last activity"
+// line and (b) a per-device newest-sync map used by the paired list.
+async function refreshActivity(status) {
+  const actEl = $("#stat-activity");
+  if (!status) {
+    actEl.textContent = "—";
+    return;
+  }
+  let entries = [];
+  try {
+    const res = await invoke("ipc_history_list", { limit: 30 });
+    entries = (res && res.entries) || [];
+  } catch {
+    actEl.textContent = "—";
+    return;
+  }
+  const peers = status.peers || [];
+  const byShort = {};
+  for (const p of peers) byShort[p.id_short] = p;
+
+  const map = {};
+  for (const e of entries) {
+    const short = String(e.origin_id).slice(0, 8);
+    if (!(short in map) || Number(e.ts_ms) > map[short]) map[short] = Number(e.ts_ms);
+  }
+  lastSyncByOrigin = map;
+
+  if (entries.length === 0) {
+    actEl.textContent = "nothing synced yet";
+    return;
+  }
+  const newest = entries[0];
+  const short = String(newest.origin_id).slice(0, 8);
+  const peer = byShort[short];
+  const what = newest.kind || "clip";
+  actEl.textContent = peer
+    ? `${relTime(newest.ts_ms)} · ${what} from ${peer.name || short}`
+    : `${relTime(newest.ts_ms)} · ${what} copied here`;
+}
+
+async function refreshStatPanel(status) {
+  const syncChip = $("#stat-sync");
+  const peersEl = $("#stat-peers");
+  const selfEl = $("#stat-self");
+
+  if (status) {
+    const peers = status.peers || [];
+    const connected = peers.filter((p) => p.connected).length;
+    syncChip.textContent = "on";
+    syncChip.className = "badge on";
+    peersEl.textContent =
+      peers.length === 0
+        ? "no paired devices"
+        : `${connected}/${peers.length} device${peers.length === 1 ? "" : "s"} connected`;
+    const self = await ensureSelfLabel();
+    const proto = status.protocol ? ` · protocol v${status.protocol}` : "";
+    selfEl.textContent = self ? self + proto : "…";
+  } else {
+    selfLabel = null;
+    syncChip.textContent = "off";
+    syncChip.className = "badge off";
+    peersEl.textContent = "start sync to connect";
+    selfEl.textContent = "—";
+  }
+  await refreshActivity(status);
+}
+
+// Poll the daemon status; drives the header, dot, stat panel, and onboarding.
 async function pollStatus() {
   let status = null;
   try {
@@ -237,6 +333,7 @@ async function pollStatus() {
     status = null;
   }
   await refreshSyncControl(status);
+  await refreshStatPanel(status);
   if (!status) {
     // Don't pop onboarding mid-start — waitForDaemon owns that transition.
     if (!syncPending) maybeShowOnboard();
@@ -405,7 +502,11 @@ async function refreshDevices() {
       row.appendChild(badge);
       const grow = el("div", "grow");
       grow.appendChild(el("div", "name", p.name || "(unnamed)"));
-      grow.appendChild(el("div", "sub", p.id_short));
+      const ls = lastSyncByOrigin[p.id_short];
+      const subText = ls
+        ? `${p.id_short} · last sync ${relTime(ls)}`
+        : `${p.id_short} · nothing synced from this device yet`;
+      grow.appendChild(el("div", "sub", subText));
       row.appendChild(grow);
       const revoke = el("button", "btn small danger", "Revoke");
       revoke.addEventListener("click", () => revokePeer(p.id_short, p.name));

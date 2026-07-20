@@ -31,6 +31,26 @@
           <span class="spinner" id="devices-spin"></span>
         </div>
 
+        <!-- Live status: who this device is, whether sync is up, and the most
+             recent synced item — visible proof the pipeline is working. -->
+        <div class="statpanel" id="statpanel">
+          <div class="stat-row">
+            <span class="stat-label">This device</span>
+            <span class="stat-value" id="stat-self">—</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Sync</span>
+            <span class="stat-value">
+              <span class="badge off" id="stat-sync">off</span>
+              <span id="stat-peers"></span>
+            </span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Last activity</span>
+            <span class="stat-value" id="stat-activity">—</span>
+          </div>
+        </div>
+
         <div class="actions-row">
           <button class="btn primary" id="pair-show-code">Show pairing code</button>
           <div class="addr-add">
