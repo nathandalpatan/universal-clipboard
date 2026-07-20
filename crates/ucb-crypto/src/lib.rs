@@ -16,7 +16,7 @@ mod pairing;
 pub use channel::{handshake_initiator, handshake_responder, SecureChannel};
 pub use error::{Error, Result};
 pub use guard::{check_clock_skew, ReplayGuard, CLOCK_SKEW_TOLERANCE_MS};
-pub use identity::{migrate_identity, Identity};
+pub use identity::{migrate_identity, migrate_secret, Identity};
 pub use keystore::{FileKeyStore, KeyStore, KeyringStore, KEYRING_SERVICE};
 pub use noise::{MAX_FRAME_LEN, NOISE_PATTERN};
 pub use pairing::pairing_code;

@@ -34,9 +34,9 @@ use clap::{Parser, Subcommand};
 
 use ucb_clipboard::{ArboardClipboard, ClipboardService};
 use ucb_core::{DeviceInfo, Platform, PROTOCOL_VERSION};
-use ucb_crypto::{migrate_identity, FileKeyStore, Identity, KeyringStore};
+use ucb_crypto::{migrate_identity, migrate_secret, FileKeyStore, Identity, KeyringStore};
 use ucb_discovery::{Advertisement, Discovery};
-use ucb_history::{History, HistoryEntry, HistoryQuery};
+use ucb_history::{History, HistoryEntry, HistoryQuery, DB_KEY_NAME};
 use ucb_sync::{pair_dial, pair_listen, Allowlist, EngineConfig, SyncEngine};
 
 use config::{build_keystore, Config, Keystore, Paths, DEFAULT_PORT};
@@ -976,6 +976,11 @@ fn cmd_keystore(paths: &Paths, action: KeystoreAction) -> Result<()> {
             {
                 anyhow::bail!("no device identity found to migrate; run `ucb init` first");
             }
+            // Carry the encrypted-history DB key across too, or the existing
+            // history.db becomes undecryptable after the switch (and an orphan
+            // secret would be left behind in the OS keychain).
+            migrate_secret(current.as_ref(), &target, DB_KEY_NAME)
+                .context("copying the history database key into the file keystore")?;
             config.keystore = Keystore::File;
             config.save(paths)?;
             println!(
@@ -997,6 +1002,8 @@ fn cmd_keystore(paths: &Paths, action: KeystoreAction) -> Result<()> {
             {
                 anyhow::bail!("no device identity found to migrate; run `ucb init` first");
             }
+            migrate_secret(current.as_ref(), &target, DB_KEY_NAME)
+                .context("copying the history database key into the OS keychain")?;
             config.keystore = Keystore::Keyring;
             config.save(paths)?;
             println!("Switched to the OS keychain keystore. Restart `ucb run` for it to take effect.");
