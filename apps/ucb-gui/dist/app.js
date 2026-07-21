@@ -420,7 +420,11 @@ $("#onboard-go").addEventListener("click", async () => {
   const keepBackground = $("#onboard-keepbg").checked;
   const msg = $("#onboard-msg");
   msg.hidden = true;
-  $("#onboard-go").disabled = true;
+  const btn = $("#onboard-go");
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add("busy");
+  btn.textContent = "Setting up…";
   try {
     const res = await invoke("onboard", { name, keepBackground });
     const id = res && res.identity && res.identity.id;
@@ -431,14 +435,20 @@ $("#onboard-go").addEventListener("click", async () => {
     msg.classList.add("err");
     msg.textContent = String(e);
   } finally {
-    $("#onboard-go").disabled = false;
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    btn.textContent = originalText;
   }
 });
 
 $("#onboard-startbtn").addEventListener("click", async () => {
   const msg = $("#onboard-msg");
   msg.hidden = true;
-  $("#onboard-startbtn").disabled = true;
+  const btn = $("#onboard-startbtn");
+  const originalText = btn.textContent;
+  btn.disabled = true;
+  btn.classList.add("busy");
+  btn.textContent = "Starting…";
   try {
     await invoke("daemon_start");
     toast("Starting sync…");
@@ -448,7 +458,9 @@ $("#onboard-startbtn").addEventListener("click", async () => {
     msg.classList.add("err");
     msg.textContent = String(e);
   } finally {
-    $("#onboard-startbtn").disabled = false;
+    btn.disabled = false;
+    btn.classList.remove("busy");
+    btn.textContent = originalText;
   }
 });
 
