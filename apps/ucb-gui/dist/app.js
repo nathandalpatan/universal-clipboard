@@ -648,22 +648,48 @@ function pairFromIncoming(a) {
   }
 }
 
-async function revokePeer(prefix, name) {
-  if (!confirm(`Revoke ${name || prefix}? This blocks re-pairing until you run \`ucb revoke --forget\`.`)) {
-    return;
-  }
-  try {
-    const res = await invoke("ipc_revoke", { prefix });
-    if (!res.ok) toast(res.detail || "Revoke failed.", "err");
-    else toast(`Revoked ${name || prefix}`);
-  } catch (e) {
-    toast(String(e), "err");
-  }
-  refreshDevices();
+// Revoke a paired device. Confirmation is an inline toast action rather than
+// window.confirm() — the Tauri webview doesn't wire up native JS dialogs, so
+// confirm() returns false without prompting and the revoke would silently no-op.
+function revokePeer(prefix, name) {
+  const who = name || prefix;
+  toast(
+    `Revoke ${who}? Re-pairing is blocked until you run \`ucb revoke --forget\`.`,
+    "err",
+    [
+      {
+        label: "Revoke",
+        onClick: async () => {
+          try {
+            const res = await invoke("ipc_revoke", { prefix });
+            if (!res || !res.ok) toast((res && res.detail) || "Revoke failed.", "err");
+            else toast(`Revoked ${who}`);
+          } catch (e) {
+            toast(String(e), "err");
+          }
+          refreshDevices();
+        },
+      },
+      { label: "Cancel", onClick: () => {} },
+    ],
+    10000
+  );
 }
 
 // Devices actions row.
 $("#pair-show-code").addEventListener("click", startListenPairing);
+
+// "Add by address" is an advanced escape hatch — keep it collapsed so it doesn't
+// compete with the primary "Show pairing code" CTA. Reveal it on demand.
+$("#addr-toggle").addEventListener("click", () => {
+  const wrap = $("#addr-add");
+  const btn = $("#addr-toggle");
+  const show = wrap.hidden;
+  wrap.hidden = !show;
+  btn.setAttribute("aria-expanded", String(show));
+  if (show) $("#addr-input").focus();
+});
+
 $("#addr-pair").addEventListener("click", () => {
   const addr = $("#addr-input").value.trim();
   if (addr) startConnectPairing(addr, addr);
@@ -699,6 +725,7 @@ async function closePairModal() {
 }
 
 $("#pair-modal-close").addEventListener("click", closePairModal);
+$("#pair-listen-cancel").addEventListener("click", closePairModal);
 $("#pair-copy").addEventListener("click", () => {
   const uri = $("#pair-uri").textContent;
   if (navigator.clipboard) navigator.clipboard.writeText(uri).catch(() => {});
@@ -1367,7 +1394,15 @@ $("#check-updates").addEventListener("click", async () => {
       status.textContent = "You're up to date.";
     }
   } catch (e) {
-    status.textContent = `Update check failed: ${e}`;
+    // A missing/unfetchable release manifest is the common case before any
+    // release is published — say so plainly instead of leaking the raw plugin
+    // error. Anything else (network, signature) still surfaces verbatim.
+    const msg = String(e);
+    if (/release JSON|Could not fetch|404|no such|not found/i.test(msg)) {
+      status.textContent = "No published releases to update to yet.";
+    } else {
+      status.textContent = `Update check failed: ${msg}`;
+    }
   } finally {
     btn.disabled = false;
   }
