@@ -12,7 +12,12 @@
       "Bash(python3 scripts/gen-icons.py)",
       "Bash(chmod +x scripts/prepare-sidecar.sh scripts/gen-icons.py)",
       "Bash(bash scripts/prepare-sidecar.sh)",
-      "Bash(awk '{s+=$4} END{print \"TOTAL PASSED \\(approx sum\\):\", s} 1')"
+      "Bash(awk '{s+=$4} END{print \"TOTAL PASSED \\(approx sum\\):\", s} 1')",
+      "Bash(nc -U \"/Users/nathandalpatan/Library/Application Support/dev.ucb.universal-clipboard/daemon.sock\")",
+      "Bash(cd /Users/nathandalpatan/Documents/tech/universal-clipboard; grep -n 'fn build_keystore' crates/ucb-daemon/src/config.rs; sed -n '/fn build_keystore/,/^}/p' crates/ucb-daemon/src/config.rs)"
+    ],
+    "additionalDirectories": [
+      "/Users/nathandalpatan/Documents/tech/universal-clipboard/crates/ucb-daemon/src"
     ]
   }
 }

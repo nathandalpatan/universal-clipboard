@@ -306,7 +306,9 @@ input[type="checkbox"] { accent-color: var(--ink); }
 
 /* ---- devices actions -------------------------------------------------------- */
 .actions-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
-.addr-add { display: flex; gap: 6px; flex: 1; min-width: 220px; }
+/* Revealed on demand via "Add by address" — a secondary, advanced affordance. */
+.addr-add { display: flex; gap: 6px; margin: -6px 0 14px; }
+.addr-add:not([hidden]) { display: flex; }
 .addr-add input { flex: 1; }
 .platform-tag { font-size: 10px; color: var(--muted); margin-left: 6px; }
 

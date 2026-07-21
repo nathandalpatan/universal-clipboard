@@ -53,10 +53,11 @@
 
         <div class="actions-row">
           <button class="btn primary" id="pair-show-code">Show pairing code</button>
-          <div class="addr-add">
-            <input type="text" id="addr-input" placeholder="ip:port or ucb://ip:port" />
-            <button class="btn small" id="addr-pair">Add by address</button>
-          </div>
+          <button class="btn small ghost" id="addr-toggle" aria-expanded="false">Add by address</button>
+        </div>
+        <div class="addr-add" id="addr-add" hidden>
+          <input type="text" id="addr-input" placeholder="ip:port or ucb://ip:port" />
+          <button class="btn small" id="addr-pair">Connect</button>
         </div>
         <p class="muted hint">
           Turn on sync (top bar) to discover nearby devices. Pairing is mutual:
@@ -192,6 +193,9 @@
             <button class="btn small" id="pair-copy">Copy</button>
           </div>
           <pre id="pair-qr" class="qr"></pre>
+          <div class="row">
+            <button class="btn" id="pair-listen-cancel">Stop listening</button>
+          </div>
         </div>
 
         <div id="pair-connecting" hidden>
