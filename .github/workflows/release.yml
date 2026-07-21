@@ -1,0 +1,128 @@
+# REL-1: signed, updatable release build for Universal Clipboard.
+#
+# On a `v*` tag push, build the workspace `ucb` daemon, stage it as a Tauri
+# sidecar, then `tauri-action` runs `tauri build` per platform, signs the
+# updater artifacts with the TAURI_SIGNING_PRIVATE_KEY secret, assembles
+# `latest.json`, and uploads every installer + `latest.json` to the GitHub
+# release the tag creates.
+#
+# Required repo secret:
+#   TAURI_SIGNING_PRIVATE_KEY  — contents of apps/ucb-gui/.updater-key (minisign
+#                                private key). See apps/ucb-gui/README.md.
+# Optional:
+#   TAURI_SIGNING_PRIVATE_KEY_PASSWORD — set to "" (empty) for the key this repo
+#                                ships; add the secret only if you regenerate the
+#                                key with a password.
+#
+# macOS builds are ad-hoc signed (no Developer ID) and therefore NOT notarized —
+# users must right-click → Open on first launch, or you must add signing +
+# notarization secrets (APPLE_CERTIFICATE, APPLE_ID, …). See the README.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# The workflow needs to create/modify the GitHub release for the tag.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: release (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            label: macos-aarch64
+            rust-target: aarch64-apple-darwin
+            tauri-args: "--target aarch64-apple-darwin --bundles app,dmg,updater"
+          - os: macos-latest
+            label: macos-x86_64
+            rust-target: x86_64-apple-darwin
+            tauri-args: "--target x86_64-apple-darwin --bundles app,dmg,updater"
+          - os: ubuntu-latest
+            label: linux-x86_64
+            rust-target: x86_64-unknown-linux-gnu
+            tauri-args: "--bundles deb,appimage,updater"
+          - os: windows-latest
+            label: windows-x86_64
+            rust-target: x86_64-pc-windows-msvc
+            tauri-args: "--bundles msi,nsis,updater"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux: workspace deps (dbus/xcb, from ci.yml) + Tauri's WebKit/AppIndicator deps.
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\napps/ucb-gui -> apps/ucb-gui/target"
+
+      # Build the daemon for the matrix target, then stage it as the sidecar the
+      # bundler expects (binaries/ucb-<triple>[.exe]).
+      - name: Build release ucb daemon
+        run: cargo build --release -p ucb-daemon --target ${{ matrix.rust-target }}
+
+      - name: Stage ucb sidecar (unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p apps/ucb-gui/binaries
+          cp "target/${{ matrix.rust-target }}/release/ucb" \
+             "apps/ucb-gui/binaries/ucb-${{ matrix.rust-target }}"
+
+      - name: Stage ucb sidecar (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p apps/ucb-gui/binaries
+          cp "target/${{ matrix.rust-target }}/release/ucb.exe" \
+             "apps/ucb-gui/binaries/ucb-${{ matrix.rust-target }}.exe"
+
+      # tauri-action builds, signs the updater artifacts, writes latest.json, and
+      # uploads everything to the release for this tag (created if missing).
+      - name: Build, sign, and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/ucb-gui
+          tagName: ${{ github.ref_name }}
+          releaseName: "Universal Clipboard ${{ github.ref_name }}"
+          releaseBody: "See the assets below to download and install. Auto-update is served from latest.json."
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          updaterJsonPreferNsis: false
+          args: ${{ matrix.tauri-args }}

@@ -1,0 +1,15 @@
+[package]
+name = "ucb-history"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ucb-core = { workspace = true }
+ucb-crypto = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }

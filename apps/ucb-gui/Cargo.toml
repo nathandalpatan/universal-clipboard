@@ -1,0 +1,59 @@
+[package]
+name = "ucb-gui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Universal Clipboard desktop GUI shell (Tauri v2 tray app)"
+publish = false
+
+# Detach from the parent cargo workspace. Like `fuzz/`, this is a standalone
+# project so the heavy Tauri dependency tree never infects `cargo build
+# --workspace` at the repo root and workspace builds stay fast. An empty
+# `[workspace]` table makes cargo treat this manifest as its own workspace root.
+[workspace]
+
+[[bin]]
+name = "ucb-gui"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# Tray icon support (UX-2 tray shell). No extra features are needed for a plain
+# window + tray app; webview uses the OS engine (WKWebView on macOS).
+tauri = { version = "2", features = ["tray-icon"] }
+# REL-1 auto-updater: checks the GitHub-releases `latest.json`, verifies the
+# minisign signature against the pubkey in tauri.conf.json, downloads + installs.
+# Desktop-only plugin; this GUI is desktop-only.
+tauri-plugin-updater = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["net", "io-util", "rt-multi-thread", "macros", "time", "sync"] }
+directories = "6"
+# Used only inside cfg-gated screenshot-protection code (HIST-7) to pull the
+# native NSWindow (macOS) / HWND (Windows) out of Tauri's window handle. Pinned
+# to 0.6 to match the version tauri 2 exposes via `HasWindowHandle`.
+raw-window-handle = "0.6"
+
+# HIST-7 (macOS screenshot exclusion via NSWindow.sharingType) and HIST-5
+# (Touch ID via LocalAuthentication). objc2 0.6 / framework crates 0.3 match the
+# versions already present in tauri 2's macOS dependency tree, so no duplicate
+# objc2 is pulled in.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSResponder", "NSView", "NSWindow"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext", "LAPublicDefines", "LAError"] }
+block2 = "0.6"
+
+# HIST-7 Windows screenshot exclusion (SetWindowDisplayAffinity). Cfg-gated and
+# compile-checked only on this branch — there is no Windows host in CI. Pinned to
+# 0.61 to match the `windows` crate already in tauri 2's Windows tree.
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+
+[features]
+# Tauri's default "custom-protocol" is used when bundling; harmless for `cargo build`.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
