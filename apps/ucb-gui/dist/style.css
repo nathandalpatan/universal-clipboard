@@ -326,7 +326,7 @@ input[type="checkbox"] { accent-color: var(--ink); }
 
 /* ---- modal ------------------------------------------------------------------ */
 /* Modals keep transform-origin: center (not trigger-anchored) per the skill. */
-.modal-backdrop {
+.modal-backdrop:not([hidden]) {
   position: fixed; inset: 0; background: rgba(20, 20, 19, 0.4);
   display: flex; align-items: center; justify-content: center; padding: 20px; z-index: 50;
 }
@@ -350,7 +350,7 @@ input[type="checkbox"] { accent-color: var(--ink); }
 .modal-close:active { transform: scale(0.92); }
 
 /* ---- onboarding -------------------------------------------------------------- */
-.onboard-backdrop {
+.onboard-backdrop:not([hidden]) {
   position: fixed; inset: 0; background: var(--bg);
   display: flex; align-items: center; justify-content: center; padding: 24px; z-index: 100;
 }
@@ -373,7 +373,7 @@ input[type="checkbox"] { accent-color: var(--ink); }
 .onboard-foot { font-size: 10px; margin-top: 20px; word-break: break-all; }
 
 /* ---- transfers panel ---------------------------------------------------------- */
-.transfers-panel {
+.transfers-panel:not([hidden]) {
   position: fixed; right: 16px; bottom: 16px; width: 320px; max-width: calc(100vw - 32px);
   display: flex; flex-direction: column; gap: 8px; z-index: 40;
 }
