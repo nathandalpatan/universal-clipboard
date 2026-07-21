@@ -86,7 +86,7 @@ Never sideways or upward.
 - **Manual peers (DISC-3):** `static_peers: [\"ip:port\", ...]` in
   config.json; the daemon synthesizes discovery events for them and they
   are dialed regardless of the device-id dial-direction rule (with backoff).
-- **History (HIST-1):** SQLCipher via `rusqlite` (bundled-sqlcipher);
+- **History (HIST-1):** SQLCipher via `rusqlite` (bundled-sqlcipher-vendored-openssl);
   database key is a 32-byte secret in the KeyStore under "history-db-key".
   Every applied clip (local and remote) is recorded. Retention: sweep on
   startup and every hour, delete items older than 30 days unless starred

@@ -2,17 +2,22 @@
 description: Branch → test → commit → push → open a PR, like a developer would
 ---
 
-You are shipping the current work as a proper pull request. Act like a careful
-developer: never push straight to `main`, and never open a PR if the tests are
-red. Work through these steps in order and stop early (reporting why) if any
-gate fails.
+You are a careful developer delivering a change end to end as a pull request:
+if the change isn't written yet, implement it; then branch → test → commit →
+push → open a PR. Never push straight to `main`, and never open a PR if the
+tests are red. Work through these steps in order and stop early (reporting why)
+if any gate fails.
 
-Optional argument (`$ARGUMENTS`): a short description of the change / desired
-branch topic. If empty, infer it from the diff.
+Argument (`$ARGUMENTS`): a plain-English description of what to fix or build
+(e.g. "fix the vague rate-limit error message"). It may be empty.
 
-## 1. Assess the working tree
+## 1. Decide the mode
 - Run `git status` and `git branch --show-current`.
-- If there are no changes to ship (clean tree, nothing ahead of `origin/main`),
+- **If there are already uncommitted changes**, ship those. Use `$ARGUMENTS`
+  (or the diff) to name the branch and write the PR.
+- **If the tree is clean and `$ARGUMENTS` describes a task**, implement it
+  first: explore the relevant crates, make the change, then continue.
+- **If the tree is clean and `$ARGUMENTS` is empty**, there's nothing to do —
   say so and stop.
 
 ## 2. Get onto a feature branch
@@ -20,6 +25,7 @@ branch topic. If empty, infer it from the diff.
   `feat/<slug>` (or `fix/<slug>`), where `<slug>` is a kebab-case summary of the
   change (from `$ARGUMENTS` or the diff). Never commit new work onto `main`.
 - If already on a non-`main` feature branch, keep using it.
+- (Do this before or right after editing — just never leave new commits on `main`.)
 
 ## 3. Run the test gates (must be green before continuing)
 Run the same checks CI runs (see `.github/workflows/ci.yml`). These can be slow —
