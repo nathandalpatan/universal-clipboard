@@ -1,0 +1,158 @@
+# REL-1 (partial): continuous integration for the universal-clipboard workspace.
+#
+# On every push and pull request, build + test + lint the whole workspace on
+# Linux and macOS, then produce a release `ucb` daemon binary as a downloadable
+# artifact.
+#
+# Signed release publishing (code-signing, the tauri-updater signed-manifest
+# pipeline, and a hosted latest.json) lives in .github/workflows/release.yml,
+# which runs on `v*` tags. This CI workflow uploads an unsigned `ucb` build
+# artifact for smoke-testing and lightly checks the Tauri GUI on macOS.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+# Cancel superseded runs on the same ref to save CI minutes.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test-lint:
+    name: build/test/lint (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Linux system deps:
+      #   - libdbus-1-dev: secret-service backend used by the `keyring` crate
+      #   - libxcb*-dev:   X11/XCB dev libs required to build `arboard`
+      #   - pkg-config:    lets the -sys crates locate the above
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libdbus-1-dev \
+            pkg-config \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test workspace
+        run: cargo test --workspace
+
+      - name: Clippy (deny warnings)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build release daemon
+        run: cargo build --release -p ucb-daemon
+
+      # The daemon's [[bin]] is named `ucb` (see crates/ucb-daemon/Cargo.toml).
+      - name: Upload ucb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ucb-${{ matrix.os }}
+          path: |
+            target/release/ucb
+            target/release/ucb.exe
+          if-no-files-found: warn
+          retention-days: 14
+
+  # BG-1: compile-check the workspace on Windows, including the `#[cfg(windows)]`
+  # service module (windows-service SCM integration) which cannot be built on the
+  # Linux/macOS runners above. Windows needs no apt-style system deps: the
+  # keyring (Windows Credential Manager), arboard, and clipboard-rs backends are
+  # all built-in on Windows. We compile-check only (no `cargo test`) — the SCM
+  # calls require a real Windows service host to exercise at runtime.
+  windows-check:
+    name: build-check (windows-latest)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      # Compile-checks the whole workspace including the ucb-daemon bin (and thus
+      # the #[cfg(windows)] service module). Tests are not built here; the pure
+      # service-config logic is unit-tested on the Linux/macOS runners.
+      - name: Check workspace
+        run: cargo check --workspace
+
+      - name: Build release daemon
+        run: cargo build --release -p ucb-daemon
+
+      - name: Upload ucb binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ucb-windows-latest
+          path: target/release/ucb.exe
+          if-no-files-found: warn
+          retention-days: 14
+
+  # REL-1: lightly exercise the standalone Tauri GUI (apps/ucb-gui) — build,
+  # clippy, and test. macOS-only to keep CI time sane (the GUI's native code is
+  # mostly macOS-specific anyway: NSWindow capture exclusion, Touch ID). The GUI
+  # is its own cargo workspace, so this does not touch the root workspace build.
+  gui-check:
+    name: gui build/clippy/test (macos-latest)
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target\napps/ucb-gui -> apps/ucb-gui/target"
+
+      # The GUI's tauri.conf.json declares the `ucb` sidecar (externalBin), so a
+      # build needs it staged. Build the daemon and stage it for the host triple.
+      - name: Build ucb daemon + stage sidecar
+        run: |
+          cargo build -p ucb-daemon
+          mkdir -p apps/ucb-gui/binaries
+          cp target/debug/ucb "apps/ucb-gui/binaries/ucb-$(rustc -vV | sed -n 's/^host: //p')"
+
+      - name: GUI clippy (deny warnings)
+        working-directory: apps/ucb-gui
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: GUI test
+        working-directory: apps/ucb-gui
+        run: cargo test
+
+      - name: GUI build
+        working-directory: apps/ucb-gui
+        run: cargo build

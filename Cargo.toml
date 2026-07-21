@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/ucb-core",
+    "crates/ucb-crypto",
+    "crates/ucb-discovery",
+    "crates/ucb-clipboard",
+    "crates/ucb-sync",
+    "crates/ucb-files",
+    "crates/ucb-history",
+    "crates/ucb-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/nathandalpatan/universal-clipboard"
+
+[workspace.dependencies]
+ucb-core = { path = "crates/ucb-core" }
+ucb-crypto = { path = "crates/ucb-crypto" }
+ucb-discovery = { path = "crates/ucb-discovery" }
+ucb-clipboard = { path = "crates/ucb-clipboard" }
+ucb-sync = { path = "crates/ucb-sync" }
+ucb-files = { path = "crates/ucb-files" }
+ucb-history = { path = "crates/ucb-history" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+blake3 = "1"
+snow = "0.10"
+chacha20poly1305 = "0.10"
+rand = "0.8"
+keyring = { version = "3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+mdns-sd = "0.13"
+arboard = { version = "3", features = ["image-data"] }
+clipboard-rs = "0.3"
+rusqlite = { version = "0.37", features = ["bundled-sqlcipher"] }
+clap = { version = "4", features = ["derive"] }
+directories = "6"
+hex = "0.4"
+qrcode = { version = "0.14", default-features = false }

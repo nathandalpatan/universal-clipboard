@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash scripts/harness-test.sh)",
+      "Bash(tasklist //FI \"IMAGENAME eq ucb.exe\")",
+      "Bash(./target/release/ucb.exe status *)",
+      "Bash(git push *)",
+      "Bash(gh pr create --base main --head build/expansion --title 'Universal Clipboard: encrypted LAN sync — core + expansion \\(38 backlog tickets\\)' --body ' *)",
+      "mcp__claude_ai_Linear__create_issue_label",
+      "mcp__claude_ai_Linear__save_issue",
+      "Bash(mkdir -p apps/ucb-gui/src apps/ucb-gui/dist apps/ucb-gui/icons)",
+      "Bash(python3 -)",
+      "Bash(ping -c 1 -t 2 192.168.1.26)",
+      "Bash(ping -c 1 -t 2 192.168.1.55)",
+      "Bash(ifconfig -l)",
+      "Bash(systemextensionsctl list *)"
+    ]
+  }
+}

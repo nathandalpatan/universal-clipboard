@@ -1,0 +1,15 @@
+[package]
+name = "ucb-clipboard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ucb-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+arboard = { workspace = true }
+clipboard-rs = { workspace = true }
+tokio = { workspace = true }
+blake3 = { workspace = true }

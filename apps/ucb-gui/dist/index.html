@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Universal Clipboard</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="dot" id="daemon-dot" title="daemon status"></span>
+        <strong>Universal Clipboard</strong>
+      </div>
+      <div class="sync-control">
+        <span class="sync-label" id="sync-label">Checking…</span>
+        <button class="btn small" id="sync-toggle" hidden>Start sync</button>
+      </div>
+      <nav class="tabs">
+        <button class="tab is-active" data-view="devices">Devices</button>
+        <button class="tab" data-view="history">History</button>
+        <button class="tab" data-view="settings">Settings</button>
+      </nav>
+    </header>
+
+    <main>
+      <!-- Devices -->
+      <section id="view-devices" class="view is-active">
+        <div class="view-head">
+          <h1>Devices</h1>
+          <span class="spinner" id="devices-spin"></span>
+        </div>
+
+        <!-- Live status: who this device is, whether sync is up, and the most
+             recent synced item — visible proof the pipeline is working. -->
+        <div class="statpanel" id="statpanel">
+          <div class="stat-row">
+            <span class="stat-label">This device</span>
+            <span class="stat-value" id="stat-self">—</span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Sync</span>
+            <span class="stat-value">
+              <span class="badge off" id="stat-sync">off</span>
+              <span id="stat-peers"></span>
+            </span>
+          </div>
+          <div class="stat-row">
+            <span class="stat-label">Last activity</span>
+            <span class="stat-value" id="stat-activity">—</span>
+          </div>
+        </div>
+
+        <div class="actions-row">
+          <button class="btn primary" id="pair-show-code">Show pairing code</button>
+          <button class="btn small ghost" id="addr-toggle" aria-expanded="false">Add by address</button>
+        </div>
+        <div class="addr-add" id="addr-add" hidden>
+          <input type="text" id="addr-input" placeholder="ip:port or ucb://ip:port" />
+          <button class="btn small" id="addr-pair">Connect</button>
+        </div>
+        <p class="muted hint">
+          Turn on sync (top bar) to discover nearby devices. Pairing is mutual:
+          one device shows a 6-digit code, the other confirms it — after that,
+          anything you copy is shared between them automatically.
+        </p>
+
+        <!-- Incoming requests (NAT-60): unpaired devices that tried to reach
+             this one. Live/informational — it grants no trust on its own, and
+             pairing still needs explicit consent + a matching code on both
+             sides. Hidden unless there is something pending. -->
+        <div id="incoming-wrap" hidden>
+          <h2 class="section-title">Incoming requests</h2>
+          <div id="incoming-body"></div>
+        </div>
+
+        <h2 class="section-title">Paired devices</h2>
+        <div id="devices-body"></div>
+
+        <h2 class="section-title">Nearby devices</h2>
+        <div id="nearby-body"></div>
+      </section>
+
+      <!-- History -->
+      <section id="view-history" class="view">
+        <div class="view-head">
+          <h1>History</h1>
+          <span class="spinner" id="history-spin"></span>
+        </div>
+
+        <!-- HIST-5: biometric lock overlay (macOS Touch ID). Hidden on
+             platforms without biometric support — history renders directly. -->
+        <div id="history-locked" class="empty locked" hidden>
+          <div class="lock-glyph">••••</div>
+          <h2>History is locked</h2>
+          <p class="muted" id="history-locked-msg">Authenticate to view your clipboard history.</p>
+          <button class="btn primary" id="history-unlock">Unlock</button>
+        </div>
+
+        <div id="history-content">
+          <div class="filters">
+            <input type="search" id="hist-search" placeholder="Search text…" />
+            <select id="hist-device"><option value="">All devices</option></select>
+            <label class="check"><input type="checkbox" id="hist-starred" /> Starred only</label>
+            <button class="btn small" id="hist-apply">Apply</button>
+          </div>
+          <div id="history-body"></div>
+          <div class="center">
+            <button class="btn small ghost" id="hist-more" hidden>Load more</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Settings -->
+      <section id="view-settings" class="view">
+        <div class="view-head"><h1>Settings</h1></div>
+
+        <div class="banner warn" id="restart-banner" hidden>
+          <span id="restart-msg">A setting changed. Restart sync to apply it.</span>
+          <button class="btn small" id="restart-sync">Restart sync</button>
+        </div>
+
+        <div class="card">
+          <label class="toggle-row">
+            <input type="checkbox" id="set-autofile" />
+            <span>
+              <strong>Automatically sync copied files</strong>
+              <span class="muted toggle-sub">
+                When on, files you copy are offered to your paired devices, and
+                incoming files are saved automatically. Off by default.
+              </span>
+            </span>
+          </label>
+          <div class="field-inline">
+            <label for="set-maxfile">Max file size (MiB)</label>
+            <input type="number" id="set-maxfile" min="1" step="1" />
+            <button class="btn small" id="set-maxfile-save">Save</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <label class="toggle-row">
+            <input type="checkbox" id="set-capture" checked />
+            <span>
+              <strong>Hide window from screenshots &amp; screen sharing</strong>
+              <span class="muted toggle-sub" id="capture-note">
+                Excludes this window from screen captures and screen sharing.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        <div class="card">
+          <h2>Software updates</h2>
+          <p class="muted" id="update-note">
+            Universal Clipboard checks for updates automatically on launch.
+          </p>
+          <div class="field-inline">
+            <button class="btn small" id="check-updates">Check for updates</button>
+            <span class="muted" id="update-status"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <h2>History lock</h2>
+          <p class="muted" id="biometric-note">
+            The History view is protected by Touch ID. It unlocks for 5 minutes,
+            and re-locks if the window stays unfocused for over a minute.
+          </p>
+        </div>
+      </section>
+    </main>
+
+    <!-- Pairing modal (shared by "Show pairing code", nearby Pair, add-by-address) -->
+    <div id="pair-modal" class="modal-backdrop" hidden>
+      <div class="modal">
+        <button class="modal-close" id="pair-modal-close" title="Close">✕</button>
+        <h2 id="pair-modal-title">Pair a device</h2>
+
+        <div id="pair-listen-info" hidden>
+          <ol class="pair-steps muted">
+            <li>On your other device, open Universal Clipboard (or install
+              <code>ucb</code>).</li>
+            <li>There, pick this device under <strong>Nearby devices</strong> and
+              click <strong>Pair</strong> — or scan the QR / run
+              <code>ucb pair --connect &lt;address&gt;</code>.</li>
+            <li>Check the 6-digit code matches on both screens, then confirm on
+              each.</li>
+          </ol>
+          <label class="fieldlabel">Pairing address</label>
+          <div class="uri-row">
+            <code id="pair-uri"></code>
+            <button class="btn small" id="pair-copy">Copy</button>
+          </div>
+          <pre id="pair-qr" class="qr"></pre>
+          <div class="row">
+            <button class="btn" id="pair-listen-cancel">Stop listening</button>
+          </div>
+        </div>
+
+        <div id="pair-connecting" hidden>
+          <p class="muted"><span class="spinner show inline"></span> Connecting to <span id="pair-target"></span>…</p>
+        </div>
+
+        <div id="pair-code-card" hidden>
+          <p class="muted">Make sure this matches the code on
+            <strong id="pair-peer">the other device</strong>:</p>
+          <div class="code" id="pair-code"></div>
+          <div class="row">
+            <button class="btn primary" id="pair-accept">Codes match — pair</button>
+            <button class="btn danger" id="pair-reject">Reject</button>
+          </div>
+        </div>
+
+        <div id="pair-result" class="banner" hidden></div>
+      </div>
+    </div>
+
+    <!-- Onboarding overlay (first run / daemon down) -->
+    <div id="onboard" class="onboard-backdrop" hidden>
+      <div class="onboard-card">
+        <div class="onboard-glyph">ucb</div>
+        <h1 id="onboard-title">Welcome to Universal Clipboard</h1>
+        <p class="muted" id="onboard-lead">
+          Sync your clipboard across your own devices over the local network,
+          end-to-end encrypted. Let's get this device set up.
+        </p>
+
+        <div id="onboard-setup">
+          <label class="fieldlabel" for="onboard-name">Device name</label>
+          <input type="text" id="onboard-name" placeholder="e.g. Work Laptop" />
+          <label class="check onboard-bg">
+            <input type="checkbox" id="onboard-keepbg" />
+            Keep syncing in the background (install a login service)
+          </label>
+          <button class="btn primary big" id="onboard-go">Set up &amp; start syncing</button>
+        </div>
+
+        <div id="onboard-start" hidden>
+          <p class="muted">This device is set up, but sync isn't running.</p>
+          <button class="btn primary big" id="onboard-startbtn">Start syncing</button>
+        </div>
+
+        <div class="banner" id="onboard-msg" hidden></div>
+        <p class="onboard-foot muted">Daemon binary: <code id="onboard-bin">…</code></p>
+      </div>
+    </div>
+
+    <!-- Active transfers panel -->
+    <div id="transfers" class="transfers-panel" hidden></div>
+
+    <!-- Toasts -->
+    <div id="toasts" class="toasts"></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

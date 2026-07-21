@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+.DS_Store
+/apps/ucb-gui/target
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/apps/ucb-gui/binaries
