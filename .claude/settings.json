@@ -14,7 +14,20 @@
       "Bash(bash scripts/prepare-sidecar.sh)",
       "Bash(awk '{s+=$4} END{print \"TOTAL PASSED \\(approx sum\\):\", s} 1')",
       "Bash(nc -U \"/Users/nathandalpatan/Library/Application Support/dev.ucb.universal-clipboard/daemon.sock\")",
-      "Bash(cd /Users/nathandalpatan/Documents/tech/universal-clipboard; grep -n 'fn build_keystore' crates/ucb-daemon/src/config.rs; sed -n '/fn build_keystore/,/^}/p' crates/ucb-daemon/src/config.rs)"
+      "Bash(cd /Users/nathandalpatan/Documents/tech/universal-clipboard; grep -n 'fn build_keystore' crates/ucb-daemon/src/config.rs; sed -n '/fn build_keystore/,/^}/p' crates/ucb-daemon/src/config.rs)",
+      "Bash(cargo test *)",
+      "Bash(cargo clippy *)",
+      "Bash(cargo check *)",
+      "Bash(cargo build *)",
+      "Bash(git push *)",
+      "Bash(git status)",
+      "Bash(git branch *)",
+      "Bash(git checkout *)",
+      "Bash(git switch *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr view *)",
+      "Bash(gh pr list *)",
+      "Bash(gh auth status)"
     ],
     "additionalDirectories": [
       "/Users/nathandalpatan/Documents/tech/universal-clipboard/crates/ucb-daemon/src"
