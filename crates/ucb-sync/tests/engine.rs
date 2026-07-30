@@ -19,7 +19,10 @@ use ucb_discovery::{Peer, PeerEvent};
 use ucb_history::{History, HistoryQuery};
 use ucb_sync::{Allowlist, EngineConfig, SyncEngine, TransferEvent};
 
-const TIMEOUT: Duration = Duration::from_secs(5);
+// Upper bound for `wait_for`; healthy runs return the instant the condition
+// holds, so this only adds headroom for CI runners saturated by the other
+// real-TCP integration tests running in parallel (a 5s bound flaked there).
+const TIMEOUT: Duration = Duration::from_secs(20);
 const POLL: Duration = Duration::from_millis(10);
 
 /// A unique temp directory for a test's on-disk state.
