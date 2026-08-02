@@ -875,6 +875,7 @@ impl Shared {
         // the same surviving connection on both sides.
         let canonical = (self.self_id < peer_id) == dialed;
         let (out_tx, mut out_rx) = mpsc::channel::<Outbound>(OUTBOUND_QUEUE);
+        let replaced_duplicate;
         {
             let mut sessions = self.sessions.lock().unwrap();
             if let Some(existing) = sessions.get(&peer_id) {
@@ -888,6 +889,9 @@ impl Shared {
                     return;
                 }
                 tracing::debug!(peer = %peer_id.short(), "canonical connection replacing a non-canonical duplicate");
+                replaced_duplicate = true;
+            } else {
+                replaced_duplicate = false;
             }
             sessions.insert(peer_id, SessionEntry { token, canonical, tx: out_tx });
         }
@@ -929,6 +933,27 @@ impl Shared {
         if drained > 0 {
             // UX-4 (sender side): what we flushed to a peer that was away.
             tracing::info!(count = drained, name = %peer_name, "synced {drained} items to {peer_name} while away");
+        }
+
+        // Simultaneous-open recovery: when this canonical session replaced a
+        // non-canonical duplicate, a clip copied in the teardown window may have
+        // been broadcast (best-effort `try_send`) to the evicted session and lost
+        // — the peer never read that socket, and nothing re-sends it. Replay our
+        // latest *locally-originated* clip over the survivor so both sides
+        // converge. Idempotent: the peer applies it only if it wins by timestamp
+        // (SYNC-3), so a clip it already has is a no-op.
+        if replaced_duplicate {
+            let local_latest = {
+                let latest = self.latest.lock().unwrap();
+                latest.clone().filter(|item| item.origin == self.self_id)
+            };
+            if let Some(item) = local_latest {
+                if chan.send(&WireMessage::Clip { seq: out_seq, item }).await.is_err() {
+                    self.deregister_session(&peer_id, token);
+                    return;
+                }
+                out_seq += 1;
+            }
         }
 
         // UX-4 (receiver side): count clips applied in the first few seconds of
