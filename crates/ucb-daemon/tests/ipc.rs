@@ -27,12 +27,18 @@ fn ucb_bin() -> &'static str {
 }
 
 fn temp_dir(tag: &str) -> PathBuf {
+    // The counter keeps dirs unique when parallel tests use the same tag: the
+    // clock alone collides (macOS timestamps have microsecond resolution).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     // Root under /tmp (not the platform temp dir) to keep the derived unix
     // socket path well under the ~104-char sun_path limit on macOS.
     let dir = PathBuf::from("/tmp").join(format!(
-        "ucb-ipc-{}-{}-{}",
+        "ucb-ipc-{}-{}-{}-{}",
         tag,
         std::process::id(),
+        n,
         SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
