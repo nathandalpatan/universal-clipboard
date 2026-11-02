@@ -6,7 +6,6 @@ license.workspace = true
 
 [dependencies]
 ucb-core = { workspace = true }
-serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 arboard = { workspace = true }

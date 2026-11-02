@@ -1757,7 +1757,6 @@ dependencies = [
  "arboard",
  "blake3",
  "clipboard-rs",
- "serde",
  "thiserror",
  "tokio",
  "tracing",
@@ -1782,11 +1781,9 @@ dependencies = [
  "blake3",
  "hex",
  "keyring",
- "serde",
  "snow",
  "thiserror",
  "tokio",
- "tracing",
  "ucb-core",
 ]
 
@@ -1808,7 +1805,6 @@ dependencies = [
  "ucb-core",
  "ucb-crypto",
  "ucb-discovery",
- "ucb-files",
  "ucb-history",
  "ucb-sync",
  "windows-service",
@@ -1820,7 +1816,6 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "mdns-sd",
- "serde",
  "thiserror",
  "tokio",
  "tracing",
@@ -1838,7 +1833,6 @@ dependencies = [
  "serde_json",
  "thiserror",
  "tokio",
- "tracing",
  "ucb-core",
 ]
 
