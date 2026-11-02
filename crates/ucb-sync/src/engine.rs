@@ -82,6 +82,9 @@ const FILE_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the engine reclaims stale file-transfer artifacts (FILE-7). Also
 /// run once at startup.
 const FILE_CLEANUP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Cap on an unauthenticated inbound handshake, so a peer that connects and
+/// stalls cannot pin a task and its frame buffer forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One thing to send out on a session: a live/queued clip, a revocation
 /// broadcast (PAIR-7), or a raw pre-built wire message (used for file-transfer
@@ -672,7 +675,10 @@ impl Shared {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let mut chan = handshake_responder(stream, self.identity.as_ref()).await?;
+        let mut chan =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_responder(stream, self.identity.as_ref()))
+                .await
+                .map_err(|_| Error::Other("inbound handshake timed out".into()))??;
         let remote_id = chan.remote_device_id();
 
         if !self.is_trusted(&remote_id, chan.remote_static_pubkey()) {
