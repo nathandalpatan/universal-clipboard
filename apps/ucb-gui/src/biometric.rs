@@ -50,6 +50,7 @@ pub fn available() -> bool {
     false
 }
 
+#[cfg(target_os = "macos")]
 type AuthOutcome = (bool, Option<String>);
 
 /// Run the biometric prompt. Async: resolves when the user completes or cancels.
