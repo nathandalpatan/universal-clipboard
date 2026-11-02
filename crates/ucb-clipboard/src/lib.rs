@@ -43,7 +43,7 @@ use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use ucb_core::{ClipboardPayload, MAX_CLIP_BYTES};
@@ -59,7 +59,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClipboardEvent {
     /// Inline clipboard content (text / HTML / image).
-    Payload(ClipboardPayload),
+    Payload {
+        payload: ClipboardPayload,
+        /// When the watcher observed the change. The engine timestamps the clip
+        /// from this, and uses it to tell whether a remote write overwrote the
+        /// copy before the engine handled it (SYNC-3).
+        detected_at: Instant,
+    },
     /// The clipboard holds one or more file references (e.g. a Finder copy).
     /// Carries the local absolute paths; the transfer of their bytes is the
     /// engine's concern, not this crate's.
@@ -705,7 +711,10 @@ fn worker_loop<C: SystemClipboard>(
                                             "clipboard payload exceeds MAX_CLIP_BYTES; skipping"
                                         );
                                     } else if event_tx
-                                        .blocking_send(ClipboardEvent::Payload(payload))
+                                        .blocking_send(ClipboardEvent::Payload {
+                                            payload,
+                                            detected_at: Instant::now(),
+                                        })
                                         .is_err()
                                     {
                                         break; // event receiver dropped -> shut down
@@ -742,7 +751,7 @@ mod tests {
     /// Receive and unwrap the next event as an inline payload.
     async fn recv(rx: &mut mpsc::Receiver<ClipboardEvent>) -> ClipboardPayload {
         match recv_event(rx).await {
-            ClipboardEvent::Payload(p) => p,
+            ClipboardEvent::Payload { payload, .. } => payload,
             ClipboardEvent::Files(f) => panic!("expected a payload event, got Files({f:?})"),
         }
     }
@@ -751,7 +760,9 @@ mod tests {
     async fn recv_files(rx: &mut mpsc::Receiver<ClipboardEvent>) -> Vec<PathBuf> {
         match recv_event(rx).await {
             ClipboardEvent::Files(f) => f,
-            ClipboardEvent::Payload(p) => panic!("expected a Files event, got Payload({p:?})"),
+            ClipboardEvent::Payload { payload, .. } => {
+                panic!("expected a Files event, got Payload({payload:?})")
+            }
         }
     }
 
