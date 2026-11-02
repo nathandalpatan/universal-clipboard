@@ -84,11 +84,11 @@ jobs:
           retention-days: 14
 
   # BG-1: compile-check the workspace on Windows, including the `#[cfg(windows)]`
-  # service module (windows-service SCM integration) which cannot be built on the
-  # Linux/macOS runners above. Windows needs no apt-style system deps: the
+  # login-autostart module (HKCU Run entry) and the `ucbw` launcher, which cannot
+  # be built on the Linux/macOS runners above. Windows needs no apt-style system deps: the
   # keyring (Windows Credential Manager), arboard, and clipboard-rs backends are
-  # all built-in on Windows. We compile-check only (no `cargo test`) — the SCM
-  # calls require a real Windows service host to exercise at runtime.
+  # all built-in on Windows. We compile-check only (no `cargo test`) — the registry
+  # calls change the runner's real login entries, so they aren't exercised here.
   windows-check:
     name: build-check (windows-latest)
     runs-on: windows-latest
@@ -102,8 +102,8 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
 
-      # Compile-checks the whole workspace including the ucb-daemon bin (and thus
-      # the #[cfg(windows)] service module). Tests are not built here; the pure
+      # Compile-checks the whole workspace including the ucb-daemon bins (and thus
+      # the #[cfg(windows)] service module and `ucbw`). Tests are not built here; the pure
       # service-config logic is unit-tested on the Linux/macOS runners.
       - name: Check workspace
         run: cargo check --workspace
@@ -115,7 +115,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ucb-windows-latest
-          path: target/release/ucb.exe
+          path: |
+            target/release/ucb.exe
+            target/release/ucbw.exe
           if-no-files-found: warn
           retention-days: 14
 
@@ -153,8 +155,13 @@ jobs:
         shell: bash
         run: |
           mkdir -p apps/ucb-gui/binaries
-          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
-          touch "apps/ucb-gui/binaries/ucb-$(rustc -vV | sed -n 's/^host: //p')$ext"
+          triple="$(rustc -vV | sed -n 's/^host: //p')"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            # tauri.windows.conf.json also bundles the `ucbw` launcher.
+            touch "apps/ucb-gui/binaries/ucb-$triple.exe" "apps/ucb-gui/binaries/ucbw-$triple.exe"
+          else
+            touch "apps/ucb-gui/binaries/ucb-$triple"
+          fi
 
       - name: GUI clippy (deny warnings)
         working-directory: apps/ucb-gui

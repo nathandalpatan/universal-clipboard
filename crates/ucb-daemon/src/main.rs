@@ -409,7 +409,7 @@ EXAMPLES:
     },
     /// Install or remove the background service that runs `ucb run` (BG-1/BG-6).
     ///
-    /// Writes a launchd/systemd (or Windows SCM) definition that starts `ucb run`
+    /// Writes a launchd/systemd definition (or, on Windows, a login `Run` entry) that starts `ucb run`
     /// at login. Install prints the exact activation command to run next unless
     /// you pass `--activate` to run it for you.
     #[command(after_help = "\
@@ -1419,13 +1419,13 @@ fn cmd_service(
     let exe = std::env::current_exe().context("resolving the current executable path")?;
     let args = service::run_args(config_dir_override.as_deref());
 
-    // Windows (BG-1): register/manage via the SCM instead of a launchd/systemd
+    // Windows (BG-1): a per-user login `Run` entry instead of a launchd/systemd
     // definition file.
     #[cfg(windows)]
     {
         return match action {
             ServiceAction::Install { activate } => service::windows::install(&exe, &args, activate),
-            ServiceAction::Uninstall { activate } => service::windows::uninstall(activate),
+            ServiceAction::Uninstall { .. } => service::windows::uninstall(),
             ServiceAction::Status => service::windows::status(),
         };
     }

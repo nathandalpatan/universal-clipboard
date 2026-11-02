@@ -100,13 +100,17 @@ jobs:
           cp "target/${{ matrix.rust-target }}/release/ucb" \
              "apps/ucb-gui/binaries/ucb-${{ matrix.rust-target }}"
 
+      # Windows also bundles `ucbw`, the windowless launcher the login autostart
+      # entry runs (see apps/ucb-gui/tauri.windows.conf.json).
       - name: Stage ucb sidecar (windows)
         if: runner.os == 'Windows'
         shell: bash
         run: |
           mkdir -p apps/ucb-gui/binaries
-          cp "target/${{ matrix.rust-target }}/release/ucb.exe" \
-             "apps/ucb-gui/binaries/ucb-${{ matrix.rust-target }}.exe"
+          for bin in ucb ucbw; do
+            cp "target/${{ matrix.rust-target }}/release/$bin.exe" \
+               "apps/ucb-gui/binaries/$bin-${{ matrix.rust-target }}.exe"
+          done
 
       # tauri-action builds, signs the updater artifacts, writes latest.json, and
       # uploads everything to the release for this tag (created if missing).
