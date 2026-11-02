@@ -82,6 +82,9 @@ const FILE_STALE_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// How often the engine reclaims stale file-transfer artifacts (FILE-7). Also
 /// run once at startup.
 const FILE_CLEANUP_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
+/// Cap on an unauthenticated inbound handshake, so a peer that connects and
+/// stalls cannot pin a task and its frame buffer forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One thing to send out on a session: a live/queued clip, a revocation
 /// broadcast (PAIR-7), or a raw pre-built wire message (used for file-transfer
@@ -579,12 +582,12 @@ impl Shared {
             match target {
                 Some(id) => sessions
                     .get(&id)
-                    .map(|e| e.tx.clone())
+                    .map(|e| e.tx.downgrade())
                     .ok_or_else(|| Error::Other(format!("peer {} is not connected", id.short())))?,
                 None => {
                     let mut iter = sessions.iter();
                     match (iter.next(), iter.next()) {
-                        (Some((_, entry)), None) => entry.tx.clone(),
+                        (Some((_, entry)), None) => entry.tx.downgrade(),
                         (None, _) => {
                             return Err(Error::Other(
                                 "no connected peers to send to".to_string(),
@@ -672,7 +675,10 @@ impl Shared {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send,
     {
-        let mut chan = handshake_responder(stream, self.identity.as_ref()).await?;
+        let mut chan =
+            tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake_responder(stream, self.identity.as_ref()))
+                .await
+                .map_err(|_| Error::Other("inbound handshake timed out".into()))??;
         let remote_id = chan.remote_device_id();
 
         if !self.is_trusted(&remote_id, chan.remote_static_pubkey()) {
@@ -1639,7 +1645,9 @@ impl Shared {
 async fn send_pump(
     mut transfer: SendTransfer,
     offer: WireMessage,
-    out_tx: mpsc::Sender<Outbound>,
+    // Weak so a revoked/evicted session's channel closes mid-transfer instead
+    // of staying open until the pump finishes.
+    out_tx: mpsc::WeakSender<Outbound>,
     mut inbound_rx: mpsc::Receiver<WireMessage>,
     progress: Option<mpsc::Sender<SendProgress>>,
     transfers: broadcast::Sender<TransferEvent>,
@@ -1659,7 +1667,7 @@ async fn send_pump(
     };
 
     // 1. Transmit the offer.
-    if out_tx.send(Outbound::Raw(offer)).await.is_err() {
+    if !send_weak(&out_tx, Outbound::Raw(offer)).await {
         let _ = result_tx.send(report(false, "session closed before offer".into()));
         return;
     }
@@ -1693,7 +1701,7 @@ async fn send_pump(
     loop {
         match transfer.next_chunk().await {
             Ok(Some(chunk)) => {
-                if out_tx.send(Outbound::Raw(chunk)).await.is_err() {
+                if !send_weak(&out_tx, Outbound::Raw(chunk)).await {
                     let _ = result_tx.send(report(false, "session closed mid-transfer".into()));
                     return;
                 }
@@ -1749,6 +1757,14 @@ async fn send_pump(
                 return;
             }
         }
+    }
+}
+
+/// Send on a session that may already be gone; `false` if it is.
+async fn send_weak(tx: &mpsc::WeakSender<Outbound>, msg: Outbound) -> bool {
+    match tx.upgrade() {
+        Some(tx) => tx.send(msg).await.is_ok(),
+        None => false,
     }
 }
 
