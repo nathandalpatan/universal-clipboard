@@ -1,8 +1,9 @@
 // Universal Clipboard — desktop GUI shell (Tauri v2 tray app).
 //
 // This is a *frontend*: the daemon (`ucb run`) stays the single engine process.
-// Every command here opens a short-lived connection to the daemon's unix socket
-// (the existing newline-delimited JSON IPC) and relays one request/response.
+// Every command here opens a short-lived connection to the daemon's IPC socket
+// (unix socket, or named pipe on Windows; newline-delimited JSON) and relays one
+// request/response.
 // No direct dependency on the `ucb-*` crates — JSON in, JSON out.
 //
 // Tickets: HIST-3 (history GUI), UX-2 (devices + pair CTA), PAIR-2 (on-screen
@@ -13,32 +14,31 @@ mod biometric;
 mod capture;
 mod sensitive;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Emitter, Manager};
 
-#[cfg(unix)]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-#[cfg(unix)]
-use tokio::net::unix::OwnedWriteHalf;
-#[cfg(unix)]
-use tokio::net::UnixStream;
-#[cfg(unix)]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::sync::Mutex;
+
+/// The daemon IPC transport: a unix socket, or on Windows the named pipe the
+/// daemon derives from the same socket path (see `crates/ucb-daemon/src/ipc.rs`).
+#[cfg(unix)]
+type IpcStream = tokio::net::UnixStream;
+#[cfg(windows)]
+type IpcStream = tokio::net::windows::named_pipe::NamedPipeClient;
+
+type IpcReader = BufReader<ReadHalf<IpcStream>>;
+type IpcWriter = WriteHalf<IpcStream>;
 
 /// Holds the write half of the *live* pairing connection so `pair_confirm` can
 /// answer the daemon on the same socket the code arrived on. `None` when no
 /// pairing is in progress.
-#[cfg(unix)]
 #[derive(Default)]
-struct PairState(Mutex<Option<OwnedWriteHalf>>);
-
-#[cfg(not(unix))]
-#[derive(Default)]
-struct PairState;
+struct PairState(Mutex<Option<IpcWriter>>);
 
 /// Resolve the daemon's IPC socket path, mirroring the daemon's own layout
 /// (`ProjectDirs("dev","ucb","universal-clipboard")/daemon.sock`). Overridable
@@ -56,36 +56,70 @@ fn socket_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("daemon.sock"))
 }
 
-/// Send one newline-terminated JSON request to the daemon and read exactly one
-/// reply line back. Used by every single-shot command (everything but pairing).
 #[cfg(unix)]
-async fn send_request(req: String) -> Result<serde_json::Value, String> {
+async fn open_stream(path: &Path) -> std::io::Result<IpcStream> {
+    tokio::net::UnixStream::connect(path).await
+}
+
+/// Open the daemon's named pipe. The pipe name must match the daemon's
+/// `windows_pipe::pipe_name` exactly; it is a hash of the socket path so
+/// sandboxed daemons (distinct config dirs) get distinct pipes. Retries briefly
+/// on `ERROR_PIPE_BUSY` (all server instances momentarily in use).
+#[cfg(windows)]
+async fn open_stream(path: &Path) -> std::io::Result<IpcStream> {
+    use std::hash::{Hash, Hasher};
+    use tokio::net::windows::named_pipe::ClientOptions;
+
+    const ERROR_PIPE_BUSY: i32 = 231;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    let name = format!(r"\\.\pipe\ucb-{:016x}", hasher.finish());
+    let mut attempt = 0;
+    loop {
+        match ClientOptions::new().open(&name) {
+            Err(e) if e.raw_os_error() == Some(ERROR_PIPE_BUSY) && attempt < 19 => {
+                attempt += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            res => return res,
+        }
+    }
+}
+
+/// Connect to the daemon and split the connection into a line reader and a
+/// writer.
+async fn connect() -> Result<(IpcReader, IpcWriter), String> {
     let path = socket_path();
-    let stream = UnixStream::connect(&path).await.map_err(|e| {
+    let stream = open_stream(&path).await.map_err(|e| {
         format!(
-            "could not reach the daemon at {} ({e}). Is `ucb run` active?",
+            "could not reach the daemon at {} ({e}). Is sync running?",
             path.display()
         )
     })?;
-    let (read_half, mut write_half) = stream.into_split();
-    write_half
-        .write_all(req.as_bytes())
+    let (read_half, write_half) = tokio::io::split(stream);
+    Ok((BufReader::new(read_half), write_half))
+}
+
+/// Write one request line (appending the newline) and flush.
+async fn write_line(w: &mut IpcWriter, req: &str) -> Result<(), String> {
+    w.write_all(req.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
-    write_half.write_all(b"\n").await.map_err(|e| e.to_string())?;
-    write_half.flush().await.map_err(|e| e.to_string())?;
+    w.write_all(b"\n").await.map_err(|e| e.to_string())?;
+    w.flush().await.map_err(|e| e.to_string())
+}
 
-    let mut reader = BufReader::new(read_half);
+/// Send one newline-terminated JSON request to the daemon and read exactly one
+/// reply line back. Used by every single-shot command (everything but pairing).
+async fn send_request(req: String) -> Result<serde_json::Value, String> {
+    let (mut reader, mut write_half) = connect().await?;
+    write_line(&mut write_half, &req).await?;
+
     let mut line = String::new();
     if reader.read_line(&mut line).await.map_err(|e| e.to_string())? == 0 {
         return Err("daemon closed the connection without a reply".into());
     }
     serde_json::from_str(line.trim()).map_err(|e| format!("bad daemon reply: {e}"))
-}
-
-#[cfg(not(unix))]
-async fn send_request(_req: String) -> Result<serde_json::Value, String> {
-    Err("the GUI IPC client is only implemented for unix-socket platforms".into())
 }
 
 // --- single-shot commands --------------------------------------------------
@@ -171,27 +205,14 @@ async fn ipc_incoming() -> Result<serde_json::Value, String> {
 /// that relays every later line (`code`, `result`) to the frontend as
 /// `pair://event` events. The write half is stashed in [`PairState`] so
 /// `pair_confirm` can answer on the same socket.
-#[cfg(unix)]
 #[tauri::command]
 async fn pair_start(
     app: tauri::AppHandle,
     state: tauri::State<'_, PairState>,
 ) -> Result<serde_json::Value, String> {
-    let path = socket_path();
-    let stream = UnixStream::connect(&path).await.map_err(|e| {
-        format!(
-            "could not reach the daemon at {} ({e}). Is `ucb run` active?",
-            path.display()
-        )
-    })?;
-    let (read_half, mut write_half) = stream.into_split();
-    write_half
-        .write_all(b"{\"cmd\":\"pair_listen_start\"}\n")
-        .await
-        .map_err(|e| e.to_string())?;
-    write_half.flush().await.map_err(|e| e.to_string())?;
+    let (mut reader, mut write_half) = connect().await?;
+    write_line(&mut write_half, r#"{"cmd":"pair_listen_start"}"#).await?;
 
-    let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     if reader.read_line(&mut line).await.map_err(|e| e.to_string())? == 0 {
         return Err("daemon closed the connection".into());
@@ -239,34 +260,20 @@ async fn pair_start(
 /// answers on the same socket, and streams every daemon line (`code`, `result`,
 /// `error`) to the frontend as `pair://event` events. Returns immediately; the
 /// 6-digit code arrives as an event once the handshake completes.
-#[cfg(unix)]
 #[tauri::command]
 async fn pair_connect_start(
     app: tauri::AppHandle,
     addr: String,
     state: tauri::State<'_, PairState>,
 ) -> Result<(), String> {
-    let path = socket_path();
-    let stream = UnixStream::connect(&path).await.map_err(|e| {
-        format!(
-            "could not reach the daemon at {} ({e}). Is sync running?",
-            path.display()
-        )
-    })?;
-    let (read_half, mut write_half) = stream.into_split();
+    let (mut reader, mut write_half) = connect().await?;
     let req = serde_json::json!({ "cmd": "pair_connect", "addr": addr }).to_string();
-    write_half
-        .write_all(req.as_bytes())
-        .await
-        .map_err(|e| e.to_string())?;
-    write_half.write_all(b"\n").await.map_err(|e| e.to_string())?;
-    write_half.flush().await.map_err(|e| e.to_string())?;
+    write_line(&mut write_half, &req).await?;
 
     *state.0.lock().await = Some(write_half);
 
     let app2 = app.clone();
     tokio::spawn(async move {
-        let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         loop {
             line.clear();
@@ -291,17 +298,13 @@ async fn pair_connect_start(
 }
 
 /// Answer the pairing in progress with the user's accept/reject decision.
-#[cfg(unix)]
 #[tauri::command]
 async fn pair_confirm(accept: bool, state: tauri::State<'_, PairState>) -> Result<(), String> {
     let mut guard = state.0.lock().await;
     match guard.as_mut() {
         Some(w) => {
-            let line = format!("{{\"cmd\":\"pair_confirm\",\"accept\":{accept}}}\n");
-            w.write_all(line.as_bytes())
-                .await
-                .map_err(|e| e.to_string())?;
-            w.flush().await.map_err(|e| e.to_string())?;
+            let line = format!("{{\"cmd\":\"pair_confirm\",\"accept\":{accept}}}");
+            write_line(w, &line).await?;
             // The daemon will send `result` and close; release the connection.
             *guard = None;
             Ok(())
@@ -312,40 +315,10 @@ async fn pair_confirm(accept: bool, state: tauri::State<'_, PairState>) -> Resul
 
 /// Abandon the pairing in progress (drops the connection; the daemon sees EOF
 /// and declines, freeing its single pairing slot).
-#[cfg(unix)]
 #[tauri::command]
 async fn pair_cancel(state: tauri::State<'_, PairState>) -> Result<(), String> {
     *state.0.lock().await = None;
     Ok(())
-}
-
-// Non-unix stubs so `generate_handler!` resolves on every platform.
-#[cfg(not(unix))]
-#[tauri::command]
-async fn pair_start(
-    _app: tauri::AppHandle,
-    _state: tauri::State<'_, PairState>,
-) -> Result<serde_json::Value, String> {
-    Err("pairing IPC is only implemented for unix-socket platforms".into())
-}
-#[cfg(not(unix))]
-#[tauri::command]
-async fn pair_confirm(_accept: bool, _state: tauri::State<'_, PairState>) -> Result<(), String> {
-    Err("pairing IPC is only implemented for unix-socket platforms".into())
-}
-#[cfg(not(unix))]
-#[tauri::command]
-async fn pair_cancel(_state: tauri::State<'_, PairState>) -> Result<(), String> {
-    Ok(())
-}
-#[cfg(not(unix))]
-#[tauri::command]
-async fn pair_connect_start(
-    _app: tauri::AppHandle,
-    _addr: String,
-    _state: tauri::State<'_, PairState>,
-) -> Result<(), String> {
-    Err("pairing IPC is only implemented for unix-socket platforms".into())
 }
 
 // --- transfers (streaming over one persistent connection) ------------------
@@ -355,27 +328,14 @@ async fn pair_connect_start(
 /// frontend as a `transfer://event`. When the stream ends (daemon gone or socket
 /// dropped) it emits a final `{"type":"stream_closed"}` so the frontend can
 /// reconnect. Returns immediately.
-#[cfg(unix)]
 #[tauri::command]
 async fn transfers_start(app: tauri::AppHandle) -> Result<(), String> {
-    let path = socket_path();
-    let stream = UnixStream::connect(&path).await.map_err(|e| {
-        format!(
-            "could not reach the daemon at {} ({e}). Is sync running?",
-            path.display()
-        )
-    })?;
-    let (read_half, mut write_half) = stream.into_split();
-    write_half
-        .write_all(b"{\"cmd\":\"transfers_subscribe\"}\n")
-        .await
-        .map_err(|e| e.to_string())?;
-    write_half.flush().await.map_err(|e| e.to_string())?;
+    let (mut reader, mut write_half) = connect().await?;
+    write_line(&mut write_half, r#"{"cmd":"transfers_subscribe"}"#).await?;
 
     tokio::spawn(async move {
         // Keep the write half alive for the lifetime of the stream.
         let _write = write_half;
-        let mut reader = BufReader::new(read_half);
         let mut line = String::new();
         loop {
             line.clear();
@@ -393,12 +353,6 @@ async fn transfers_start(app: tauri::AppHandle) -> Result<(), String> {
         }
     });
     Ok(())
-}
-
-#[cfg(not(unix))]
-#[tauri::command]
-async fn transfers_start(_app: tauri::AppHandle) -> Result<(), String> {
-    Err("transfer IPC is only implemented for unix-socket platforms".into())
 }
 
 // --- HIST-5/6/7 history-protection commands --------------------------------
@@ -529,6 +483,14 @@ fn ucb_command() -> std::process::Command {
     let mut cmd = std::process::Command::new(locate_ucb());
     if let Ok(dir) = std::env::var("UCB_CONFIG_DIR") {
         cmd.args(["--config-dir", &dir]);
+    }
+    // `ucb` is a console app; without this each spawn from the (windowless) GUI
+    // flashes or keeps open a console window.
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
     }
     cmd
 }
