@@ -8,6 +8,11 @@ license.workspace = true
 name = "ucb"
 path = "src/main.rs"
 
+# Windows: windowless launcher the login `Run` entry starts (see src/bin/ucbw.rs).
+[[bin]]
+name = "ucbw"
+path = "src/bin/ucbw.rs"
+
 [dependencies]
 ucb-core = { workspace = true }
 ucb-crypto = { workspace = true }
@@ -26,8 +31,7 @@ directories = { workspace = true }
 hex = { workspace = true }
 qrcode = { workspace = true }
 
-# BG-1: Windows background service (SCM) integration. Target-specific so it is
-# only pulled in when building for Windows; the root workspace manifest is
-# intentionally left untouched.
+# BG-1: Windows login autostart (HKCU Run entry). Target-specific so it is only
+# pulled in when building for Windows; 0.59 is already in the lockfile.
 [target.'cfg(windows)'.dependencies]
-windows-service = "0.7"
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Registry"] }

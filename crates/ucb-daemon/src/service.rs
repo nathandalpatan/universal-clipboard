@@ -1,5 +1,6 @@
 //! Desktop background service integration (BG-1/BG-6): generate and manage a
-//! launchd agent (macOS) or systemd user unit (Linux) that runs `ucb run`.
+//! launchd agent (macOS), systemd user unit (Linux) or per-user login `Run`
+//! entry (Windows) that runs `ucb run`.
 //!
 //! The plist / unit *content* is produced by the pure functions
 //! [`launchd_plist`] and [`systemd_unit`] (unit-tested below). Installation only
@@ -17,19 +18,60 @@ use anyhow::{anyhow, Context, Result};
 #[cfg(not(windows))]
 pub const SERVICE_LABEL: &str = "dev.ucb.universal-clipboard";
 
-/// Windows service key name (`sc`/SCM identifier) and human-readable label.
-/// Kept available on all platforms so the pure logic can be unit-tested
-/// cross-platform (the SCM calls themselves live in the `windows` module).
-/// Off Windows these are only referenced by the cross-platform test.
+/// Windows (BG-1): the daemon autostarts at login from a per-user entry under
+/// this HKCU key. A Windows Service can't be used: services run in session 0 and
+/// can't reach the signed-in user's clipboard, need Administrator rights to
+/// install, and run as another account with its own config dir.
+/// Kept on all platforms so the pure helpers below are unit-tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const WINDOWS_SERVICE_NAME: &str = "ucb";
-/// Display name shown in the Windows Services console.
+pub const WINDOWS_RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+/// Value name of the login entry under [`WINDOWS_RUN_KEY`].
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const WINDOWS_DISPLAY_NAME: &str = "Universal Clipboard";
-/// Service description registered with the SCM.
+pub const WINDOWS_RUN_VALUE: &str = "UniversalClipboard";
+/// The windowless launcher (`src/bin/ucbw.rs`) the login entry starts, so no
+/// console window opens. Shipped next to `ucb.exe`.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub const SERVICE_DESCRIPTION: &str =
-    "End-to-end encrypted LAN clipboard sync daemon (ucb run).";
+pub const WINDOWS_LAUNCHER: &str = "ucbw.exe";
+
+/// Quote one argument by the MSVC / `CommandLineToArgvW` rules, so the stored
+/// command line splits back into exactly `arg`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.to_string();
+    }
+    let mut out = String::from('"');
+    let mut backslashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => backslashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(backslashes * 2 + 1));
+                out.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                out.push_str(&"\\".repeat(backslashes));
+                out.push(c);
+                backslashes = 0;
+            }
+        }
+    }
+    // Backslashes before the closing quote must be doubled.
+    out.push_str(&"\\".repeat(backslashes * 2));
+    out.push('"');
+    out
+}
+
+/// The command line stored in the Windows login entry: `launcher` then `args`.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_run_command(launcher: &str, args: &[String]) -> String {
+    std::iter::once(launcher)
+        .chain(args.iter().map(String::as_str))
+        .map(windows_quote)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 /// Which init system this platform uses.
 ///
@@ -46,8 +88,8 @@ pub enum ServiceKind {
 
 #[cfg(not(windows))]
 impl ServiceKind {
-    /// The init system for the host platform, or `None` on unsupported ones
-    /// (e.g. Windows — deferred, see ARCHITECTURE.md).
+    /// The init system for the host platform, or `None` on unsupported ones.
+    /// (Windows uses a login `Run` entry instead; see the `windows` module.)
     pub fn current() -> Option<Self> {
         #[cfg(target_os = "macos")]
         {
@@ -196,7 +238,7 @@ pub fn definition_for_current(
     args: &[String],
 ) -> Result<Definition> {
     let kind = ServiceKind::current().ok_or_else(|| {
-        anyhow!("background-service install is not supported on this platform yet (Windows is deferred; see ARCHITECTURE.md)")
+        anyhow!("background-service install is not supported on this platform yet")
     })?;
     let path = definition_path(kind, home);
     let (content, activate_cmd, deactivate_cmd) = match kind {
@@ -240,113 +282,160 @@ pub fn write_definition(def: &Definition) -> Result<()> {
     Ok(())
 }
 
-/// Windows service integration (BG-1): register/remove/query the ucb daemon as
-/// a Windows service via the SCM, using the `windows-service` crate.
-///
-/// The service is registered to launch `ucb run` (honoring any active
-/// `--config-dir` override, via [`run_args`]) as an auto-start LocalSystem
-/// service. Note: a service started by the SCM must speak the service-control
-/// protocol; this module handles registration/management — a production install
-/// would pair it with a service entry point. The management surface here mirrors
-/// the launchd/systemd flow so `ucb service {install,uninstall,status}` works on
-/// Windows instead of returning the previous "unsupported" error.
+/// Windows login autostart (BG-1): a per-user `HKCU\...\Run` entry that starts
+/// the daemon through the windowless [`WINDOWS_LAUNCHER`] at sign-in. No
+/// Administrator rights; the daemon runs in the user's session with the user's
+/// config dir, so it can reach the clipboard.
 #[cfg(windows)]
 pub mod windows {
-    use std::ffi::OsString;
     use std::path::Path;
+    use std::process::{Command, Stdio};
 
-    use anyhow::{Context, Result};
-    use windows_service::service::{
-        ServiceAccess, ServiceErrorControl, ServiceInfo, ServiceStartType, ServiceState,
-        ServiceType,
+    use anyhow::{bail, Context, Result};
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows_sys::Win32::System::Registry::{
+        RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW, HKEY_CURRENT_USER, REG_SZ,
+        RRF_RT_REG_SZ,
     };
-    use windows_service::service_manager::{ServiceManager, ServiceManagerAccess};
 
-    use super::{SERVICE_DESCRIPTION, WINDOWS_DISPLAY_NAME, WINDOWS_SERVICE_NAME};
+    use super::{windows_run_command, WINDOWS_LAUNCHER, WINDOWS_RUN_KEY, WINDOWS_RUN_VALUE};
 
-    fn manager(access: ServiceManagerAccess) -> Result<ServiceManager> {
-        ServiceManager::local_computer(None::<&str>, access)
-            .context("opening the Windows service manager (run as Administrator)")
+    /// NUL-terminated UTF-16 for the Win32 `W` APIs.
+    fn wide(s: &str) -> Vec<u16> {
+        s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
-    /// Register the ucb service with the SCM, launching `program` with `args`
-    /// (`ucb run`). Optionally start it immediately.
-    pub fn install(program: &Path, args: &[String], start_now: bool) -> Result<()> {
-        let manager =
-            manager(ServiceManagerAccess::CONNECT | ServiceManagerAccess::CREATE_SERVICE)?;
-        let info = ServiceInfo {
-            name: OsString::from(WINDOWS_SERVICE_NAME),
-            display_name: OsString::from(WINDOWS_DISPLAY_NAME),
-            service_type: ServiceType::OWN_PROCESS,
-            start_type: ServiceStartType::AutoStart,
-            error_control: ServiceErrorControl::Normal,
-            executable_path: program.to_path_buf(),
-            launch_arguments: args.iter().map(OsString::from).collect(),
-            dependencies: vec![],
-            account_name: None, // LocalSystem
-            account_password: None,
-        };
-        let service = manager
-            .create_service(&info, ServiceAccess::CHANGE_CONFIG | ServiceAccess::START)
-            .context("creating the ucb Windows service")?;
-        let _ = service.set_description(SERVICE_DESCRIPTION);
-        println!("Installed Windows service '{WINDOWS_SERVICE_NAME}' ({WINDOWS_DISPLAY_NAME}).");
-        println!("  {} {}", program.display(), args.join(" "));
-        if start_now {
-            let no_args: [OsString; 0] = [];
-            service
-                .start(&no_args)
-                .context("starting the ucb Windows service")?;
-            println!("Started service '{WINDOWS_SERVICE_NAME}'.");
-        } else {
-            println!("It is set to start automatically at boot. To start it now, run:");
-            println!("  sc start {WINDOWS_SERVICE_NAME}");
-        }
-        Ok(())
-    }
-
-    /// Remove the ucb service from the SCM, optionally stopping it first.
-    pub fn uninstall(stop_first: bool) -> Result<()> {
-        let manager = manager(ServiceManagerAccess::CONNECT)?;
-        let service = manager
-            .open_service(
-                WINDOWS_SERVICE_NAME,
-                ServiceAccess::QUERY_STATUS | ServiceAccess::STOP | ServiceAccess::DELETE,
+    fn set_run_value(command: &str) -> Result<()> {
+        let (key, name, data) = (wide(WINDOWS_RUN_KEY), wide(WINDOWS_RUN_VALUE), wide(command));
+        let bytes = u32::try_from(data.len() * 2).context("login command line too long")?;
+        // SAFETY: every pointer is a NUL-terminated UTF-16 buffer that outlives
+        // the call, and `bytes` is `data`'s size in bytes including the NUL.
+        let rc = unsafe {
+            RegSetKeyValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                REG_SZ,
+                data.as_ptr().cast(),
+                bytes,
             )
-            .context("opening the ucb Windows service (is it installed?)")?;
-        if stop_first {
-            if let Ok(status) = service.query_status() {
-                if status.current_state != ServiceState::Stopped {
-                    let _ = service.stop();
-                    println!("Stop requested for service '{WINDOWS_SERVICE_NAME}'.");
-                }
-            }
-        }
-        service
-            .delete()
-            .context("deleting the ucb Windows service")?;
-        println!("Removed Windows service '{WINDOWS_SERVICE_NAME}'.");
-        if !stop_first {
-            println!("If it is still running, stop it with: sc stop {WINDOWS_SERVICE_NAME}");
+        };
+        if rc != ERROR_SUCCESS {
+            bail!("writing HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE} failed (Win32 error {rc})");
         }
         Ok(())
     }
 
-    /// Report whether the ucb service is registered and its current state.
+    fn get_run_value() -> Result<Option<String>> {
+        let (key, name) = (wide(WINDOWS_RUN_KEY), wide(WINDOWS_RUN_VALUE));
+        let mut bytes: u32 = 0;
+        // SAFETY: size query; a null data pointer asks only for the byte size.
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut bytes,
+            )
+        };
+        if rc == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if rc != ERROR_SUCCESS {
+            bail!("reading HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE} failed (Win32 error {rc})");
+        }
+        let mut buf = vec![0u16; (bytes as usize).div_ceil(2)];
+        // SAFETY: `buf` holds at least `bytes` bytes, as reported by the query.
+        let rc = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                key.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            bail!("reading HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE} failed (Win32 error {rc})");
+        }
+        let len = (bytes as usize / 2).min(buf.len());
+        Ok(Some(
+            String::from_utf16_lossy(&buf[..len])
+                .trim_end_matches('\0')
+                .to_string(),
+        ))
+    }
+
+    /// Remove the login entry. Returns whether it existed.
+    fn delete_run_value() -> Result<bool> {
+        let (key, name) = (wide(WINDOWS_RUN_KEY), wide(WINDOWS_RUN_VALUE));
+        // SAFETY: both pointers are NUL-terminated UTF-16 buffers outliving the call.
+        let rc = unsafe { RegDeleteKeyValueW(HKEY_CURRENT_USER, key.as_ptr(), name.as_ptr()) };
+        match rc {
+            ERROR_SUCCESS => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            rc => bail!("removing HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE} failed (Win32 error {rc})"),
+        }
+    }
+
+    /// Register the login entry for `ucbw.exe <args>` (next to `exe`), and with
+    /// `start_now` also start the daemon immediately.
+    pub fn install(exe: &Path, args: &[String], start_now: bool) -> Result<()> {
+        let launcher = exe.with_file_name(WINDOWS_LAUNCHER);
+        if !launcher.exists() {
+            bail!(
+                "{} not found next to {}; it is needed to run the daemon without a console window",
+                launcher.display(),
+                exe.display()
+            );
+        }
+        let command = windows_run_command(&launcher.to_string_lossy(), args);
+        set_run_value(&command)?;
+        println!("Installed login autostart (HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}):");
+        println!("  {command}");
+        if start_now {
+            Command::new(&launcher)
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| format!("starting {}", launcher.display()))?;
+            println!("Started the daemon in the background.");
+        } else {
+            println!("It starts at your next sign-in. To start it now, run:");
+            println!("  {command}");
+        }
+        Ok(())
+    }
+
+    /// Remove the login entry. A daemon that is already running is left alone:
+    /// there is no IPC shutdown command, and killing every `ucb.exe` could take
+    /// out a GUI-managed one.
+    pub fn uninstall() -> Result<()> {
+        if delete_run_value()? {
+            println!("Removed login autostart (HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}).");
+        } else {
+            println!("Login autostart was not installed.");
+        }
+        println!("A daemon that is already running keeps syncing until you sign out.");
+        Ok(())
+    }
+
+    /// Report whether the login entry exists and what it runs.
     pub fn status() -> Result<()> {
-        let manager = manager(ServiceManagerAccess::CONNECT)?;
-        match manager.open_service(WINDOWS_SERVICE_NAME, ServiceAccess::QUERY_STATUS) {
-            Ok(service) => {
-                let status = service
-                    .query_status()
-                    .context("querying the ucb Windows service status")?;
-                println!(
-                    "Windows service '{WINDOWS_SERVICE_NAME}' is installed; state: {:?}",
-                    status.current_state
-                );
+        match get_run_value()? {
+            Some(command) => {
+                println!("Login autostart installed (HKCU\\{WINDOWS_RUN_KEY}\\{WINDOWS_RUN_VALUE}):");
+                println!("  {command}");
             }
-            Err(_) => {
-                println!("Windows service '{WINDOWS_SERVICE_NAME}' is not installed.");
+            None => {
+                println!("Login autostart not installed.");
                 println!("Install it with `ucb service install`.");
             }
         }
@@ -435,34 +524,38 @@ mod tests {
         );
     }
 
-    // Cross-platform coverage for the Windows service registration inputs: the
-    // SCM launch arguments are exactly the `ucb run` argv (with any config-dir
-    // override), and the identifiers are stable. This exercises the pure logic
-    // the `windows` module feeds to the SCM without needing a Windows host.
+    // Cross-platform coverage for the Windows login entry: the stored command
+    // line must split back into the launcher path + `ucb run` argv exactly
+    // (CommandLineToArgvW rules), including paths with spaces.
     #[test]
-    fn windows_service_identifiers_and_launch_args() {
-        assert_eq!(WINDOWS_SERVICE_NAME, "ucb");
-        assert_eq!(WINDOWS_DISPLAY_NAME, "Universal Clipboard");
-        assert!(SERVICE_DESCRIPTION.contains("clipboard"));
-
-        // Default: the service runs plain `ucb run`.
-        assert_eq!(run_args(None), vec!["run".to_string()]);
-
-        // With a sandboxed config dir, the override is carried through so the
-        // service targets the same state directory.
-        let launch = run_args(Some(Path::new("/opt/ucb-state")));
+    fn windows_run_command_plain_args_are_unquoted() {
         assert_eq!(
-            launch,
-            vec![
-                "--config-dir".to_string(),
-                "/opt/ucb-state".to_string(),
-                "run".to_string()
-            ]
+            windows_run_command(r"C:\ucb\ucbw.exe", &run_args(None)),
+            r"C:\ucb\ucbw.exe run"
         );
-        // These are what the SCM would receive as `launch_arguments`.
-        let os_args: Vec<std::ffi::OsString> =
-            launch.iter().map(std::ffi::OsString::from).collect();
-        assert_eq!(os_args.len(), 3);
-        assert_eq!(os_args[2], std::ffi::OsString::from("run"));
+    }
+
+    #[test]
+    fn windows_run_command_quotes_spaces_and_trailing_backslashes() {
+        let args = run_args(Some(Path::new(r"C:\Users\a b\cfg\")));
+        assert_eq!(
+            windows_run_command(r"C:\Program Files\Universal Clipboard\ucbw.exe", &args),
+            r#""C:\Program Files\Universal Clipboard\ucbw.exe" --config-dir "C:\Users\a b\cfg\\" run"#
+        );
+    }
+
+    #[test]
+    fn windows_quote_escapes_quotes_and_empty() {
+        assert_eq!(windows_quote(r#"say "hi""#), r#""say \"hi\"""#);
+        assert_eq!(windows_quote(r#"a\"b"#), r#""a\\\"b""#);
+        assert_eq!(windows_quote(""), r#""""#);
+        assert_eq!(windows_quote(r"C:\no-spaces\x"), r"C:\no-spaces\x");
+    }
+
+    #[test]
+    fn windows_run_entry_identifiers_are_stable() {
+        assert_eq!(WINDOWS_RUN_KEY, r"Software\Microsoft\Windows\CurrentVersion\Run");
+        assert_eq!(WINDOWS_RUN_VALUE, "UniversalClipboard");
+        assert_eq!(WINDOWS_LAUNCHER, "ucbw.exe");
     }
 }

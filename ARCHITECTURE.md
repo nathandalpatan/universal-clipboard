@@ -109,12 +109,16 @@ Never sideways or upward.
   dumps the config). When on, files copied to the clipboard are offered to
   peers and inbound offers are accepted into the received dir, capped by
   `max_auto_file_bytes` (default 100 MiB). Off by default.
-- **Windows service (BG-1):** `ucb service install|uninstall|status` on
-  Windows registers/manages the daemon with the SCM via the `windows-service`
-  crate (target-specific dep on `ucb-daemon`), replacing the previous
-  "unsupported" error. The launchd/systemd path is unchanged. Windows is
-  compile-checked by a `windows-latest` CI job (`cargo check` +
-  release build); the pure launch-arg/identifier logic is unit-tested
+- **Windows login autostart (BG-1):** `ucb service install|uninstall|status`
+  on Windows manages a per-user `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`
+  entry (`UniversalClipboard`) that starts `ucbw.exe run` at sign-in. `ucbw`
+  (`ucb-daemon/src/bin/ucbw.rs`) is a Windows-subsystem launcher that starts
+  `ucb.exe` with no console window. A Windows Service isn't used: services run
+  in session 0 and can't reach the user's clipboard, need Administrator rights,
+  and run as another account with a different config dir. No admin is needed,
+  but unlike launchd/systemd there is no restart-on-crash. `uninstall` only
+  removes the entry (there is no IPC shutdown). Windows is compile-checked by a
+  `windows-latest` CI job; the command-line quoting is unit-tested
   cross-platform.
 - **Named test cases (TEST-3):** `crates/ucb-sync/tests/named_cases.rs` makes
   the four canonical scenarios explicit and canonical: `unpaired_device_rejection`,
