@@ -144,10 +144,14 @@ jobs:
 
       # The GUI's tauri.conf.json declares the `ucb` sidecar (externalBin), so a
       # build needs it staged. Build the daemon and stage it for the host triple.
-      - name: Build ucb daemon + stage sidecar
+      # Default shell, not bash: on Windows, Git Bash's perl lacks modules the
+      # vendored OpenSSL build (rusqlite sqlcipher) needs; pwsh finds Strawberry Perl.
+      - name: Build ucb daemon
+        run: cargo build -p ucb-daemon
+
+      - name: Stage ucb sidecar
         shell: bash
         run: |
-          cargo build -p ucb-daemon
           mkdir -p apps/ucb-gui/binaries
           ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
           cp "target/debug/ucb$ext" "apps/ucb-gui/binaries/ucb-$(rustc -vV | sed -n 's/^host: //p')$ext"
