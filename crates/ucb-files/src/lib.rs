@@ -51,6 +51,8 @@ pub enum FileError {
     Io(#[from] std::io::Error),
     #[error("message is not a FileOffer")]
     NotAnOffer,
+    #[error("offer chunk count {chunk_count} does not match size {size}")]
+    BadOffer { size: u64, chunk_count: u64 },
     #[error("path has no file name component")]
     NoFileName,
     #[error("out-of-order chunk: got {got}, expected {expected}")]
@@ -304,6 +306,11 @@ impl RecvTransfer {
             } => (transfer_id, name, size, chunk_count, hash),
             _ => return Err(FileError::NotAnOffer),
         };
+        // Otherwise a peer could declare a small `size` (passing the size policy)
+        // and stream any number of full-size chunks.
+        if chunk_count != size.div_ceil(FILE_CHUNK_BYTES as u64) {
+            return Err(FileError::BadOffer { size, chunk_count });
+        }
 
         let dest_dir = dest_dir.as_ref().to_path_buf();
         tokio::fs::create_dir_all(&dest_dir).await?;
@@ -565,7 +572,10 @@ fn bytes_for_chunks(received: u64, chunk_count: u64, size: u64) -> u64 {
 fn sanitize_name(name: &str) -> Result<String> {
     // Strip everything up to the last path separator (both unix and windows).
     let base = name.rsplit(['/', '\\']).next().unwrap_or("");
-    if base.is_empty() || base == "." || base == ".." {
+    // A single Normal component also rejects Windows drive prefixes like "C:x",
+    // which `Path::join` would otherwise resolve outside the destination dir.
+    let mut parts = Path::new(base).components();
+    if !matches!((parts.next(), parts.next()), (Some(std::path::Component::Normal(_)), None)) {
         return Err(FileError::BadName(name.to_string()));
     }
     Ok(base.to_string())
@@ -985,6 +995,21 @@ mod tests {
         assert!(matches!(sanitize_name("a/b/.."), Err(FileError::BadName(_))));
         assert_eq!(sanitize_name("../../evil.txt").unwrap(), "evil.txt");
         assert_eq!(sanitize_name("plain.bin").unwrap(), "plain.bin");
+        #[cfg(windows)]
+        assert!(matches!(sanitize_name("C:evil.txt"), Err(FileError::BadName(_))));
+    }
+
+    #[tokio::test]
+    async fn offer_with_inconsistent_chunk_count_rejected() {
+        let offer = WireMessage::FileOffer {
+            transfer_id: 1,
+            name: "x.bin".into(),
+            size: 1,
+            chunk_count: 1_000_000,
+            hash: [0; 32],
+        };
+        let res = RecvTransfer::on_offer(offer, temp_dir("badoffer")).await;
+        assert!(matches!(res, Err(FileError::BadOffer { .. })));
     }
 
     #[tokio::test]
