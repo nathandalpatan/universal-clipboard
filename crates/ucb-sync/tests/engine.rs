@@ -1144,3 +1144,69 @@ async fn discovered_lists_untrusted_and_trusted_connected_peers() {
         node_a.engine.discovered()
     );
 }
+
+/// SYNC-3: a local copy made after receiving a remote clip stamped in the future
+/// (within the skew tolerance) is still broadcast. Only a remote clip that
+/// overwrote a not-yet-handled local copy may suppress it, so a peer whose clock
+/// runs ahead can't swallow later local copies.
+#[tokio::test]
+async fn local_copy_after_future_remote_clip_is_broadcast() {
+    use ucb_core::{ClipboardItem, ClipboardPayload, DeviceInfo, WireMessage, PROTOCOL_VERSION};
+
+    let dir_a = temp_dir("ahead-a");
+    let dir_c = temp_dir("ahead-c");
+    let id_a = Identity::load_or_generate(&FileKeyStore::new(dir_a.join("keys"))).unwrap();
+    let id_c = Identity::load_or_generate(&FileKeyStore::new(dir_c.join("keys"))).unwrap();
+    let (dev_c, pk_c) = (id_c.device_id(), id_c.public_key());
+    Allowlist::load(dir_a.join("trusted.json"))
+        .unwrap()
+        .add(dev_c, "C", &pk_c, now_ms())
+        .unwrap();
+    let (node_a, port_a) = start_node("A", id_a, dir_a.join("trusted.json")).await;
+
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port_a))
+        .await
+        .unwrap();
+    let mut chan = ucb_crypto::handshake_initiator(stream, &id_c).await.unwrap();
+    chan.send(&WireMessage::Hello {
+        version: PROTOCOL_VERSION,
+        device: DeviceInfo {
+            id: dev_c,
+            name: "C".into(),
+            platform: Platform::Linux,
+        },
+    })
+    .await
+    .unwrap();
+
+    // C's clock is 60 s ahead: inside the ±2 min tolerance, so A applies it.
+    let ahead = ClipboardItem {
+        payload: ClipboardPayload::Text("from-ahead".into()),
+        ts_ms: now_ms() + 60 * 1000,
+        origin: dev_c,
+    };
+    chan.send(&WireMessage::Clip { seq: 0, item: ahead })
+        .await
+        .unwrap();
+    let applied = wait_for(|| (node_a.handle.get().as_deref() == Some("from-ahead")).then_some(())).await;
+    assert!(applied.is_some(), "A should apply the in-tolerance clip");
+
+    // A local copy on A, made after that, must still reach C.
+    node_a.handle.set("local-after");
+    let deadline = tokio::time::Instant::now() + TIMEOUT;
+    let mut got = false;
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(500), chan.recv()).await {
+            Ok(Ok(WireMessage::Clip { item, .. }))
+                if item.payload == ClipboardPayload::Text("local-after".into()) =>
+            {
+                got = true;
+                break;
+            }
+            Ok(Ok(_)) | Err(_) => continue,
+            Ok(Err(e)) => panic!("session closed: {e:?}"),
+        }
+    }
+    assert!(got, "A must broadcast a local copy made after a future-stamped remote clip");
+    assert_eq!(node_a.handle.get().as_deref(), Some("local-after"));
+}

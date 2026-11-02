@@ -24,14 +24,16 @@
 //! A single shared `latest: Option<ClipboardItem>` records the most recently
 //! applied clip. An incoming clip is written to the OS clipboard only if it
 //! [`wins_over`](ucb_core::ClipboardItem::wins_over) `latest` (timestamp, then
-//! device-id tiebreak); local copies always update `latest`.
+//! device-id tiebreak); local copies always update `latest`, unless a remote
+//! clip that wins over the copy overwrote it before the engine handled it (then
+//! the clipboard already shows that clip and the copy is dropped).
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -237,6 +239,11 @@ struct Shared {
     /// Per-peer offline queue (SYNC-5), persisted next to the allowlist.
     queue: Mutex<OfflineQueue>,
     latest: Mutex<Option<ClipboardItem>>,
+    /// SYNC-3: held while applying a remote clip (decision + clipboard write) and
+    /// while handling a local copy, so the two never interleave. Holds when the
+    /// last remote clip write finished, to detect a local copy overwritten
+    /// between being observed and being handled.
+    clip_order: tokio::sync::Mutex<Option<Instant>>,
     sessions: Mutex<HashMap<DeviceId, SessionEntry>>,
     peers: Mutex<HashMap<DeviceId, Endpoint>>,
     /// Trusted peers we are actively (re)connecting to; the flag is cleared on
@@ -303,6 +310,7 @@ impl SyncEngine {
             allowlist: Mutex::new(allowlist),
             queue: Mutex::new(queue),
             latest: Mutex::new(None),
+            clip_order: tokio::sync::Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
             connectors: Mutex::new(HashMap::new()),
@@ -1064,6 +1072,7 @@ impl Shared {
                     return Ok(false);
                 }
                 // Conflict resolution (SYNC-3): apply only if it wins.
+                let mut last_remote_write = self.clip_order.lock().await;
                 let apply = {
                     let mut latest = self.latest.lock().unwrap();
                     apply_incoming(&mut latest, &item)
@@ -1072,8 +1081,9 @@ impl Shared {
                     // HIST-1/3: record the applied remote clip under the sender's
                     // display name.
                     self.record_history(&item, peer_name);
-                    if let Err(e) = self.writer.write(item.payload).await {
-                        tracing::warn!(error = %e, "failed to write clip to clipboard");
+                    match self.writer.write(item.payload).await {
+                        Ok(()) => *last_remote_write = Some(Instant::now()),
+                        Err(e) => tracing::warn!(error = %e, "failed to write clip to clipboard"),
                     }
                 }
                 Ok(apply)
@@ -1352,7 +1362,10 @@ impl Shared {
     async fn local_clip_loop(self: Arc<Self>, mut clip_rx: mpsc::Receiver<ClipboardEvent>) {
         while let Some(event) = clip_rx.recv().await {
             match event {
-                ClipboardEvent::Payload(payload) => self.broadcast_local_payload(payload),
+                ClipboardEvent::Payload {
+                    payload,
+                    detected_at,
+                } => self.handle_local_payload(payload, detected_at).await,
                 // FILE-1: a local file copy. Auto-send it to peers when enabled;
                 // otherwise ignore (copying files locally is a common action and
                 // must not silently start transfers).
@@ -1370,14 +1383,44 @@ impl Shared {
         }
     }
 
-    /// SYNC-1: broadcast a locally-copied inline payload to live peers, record it
-    /// as `latest`/history, and buffer it for offline trusted peers (SYNC-5).
-    fn broadcast_local_payload(self: &Arc<Self>, payload: ClipboardPayload) {
+    /// SYNC-3: handle a local copy observed at `detected_at`.
+    ///
+    /// A remote clip may have been written to the clipboard after the copy was
+    /// observed but before it got here, replacing it on screen. In that case the
+    /// copy and that remote clip are settled by the normal conflict rule: if the
+    /// remote clip wins, the clipboard already shows it and the copy is dropped;
+    /// otherwise the copy is written back so this device's clipboard matches the
+    /// `latest` it broadcasts. Without this, the two devices could settle on
+    /// different values for good.
+    async fn handle_local_payload(self: &Arc<Self>, payload: ClipboardPayload, detected_at: Instant) {
+        let last_remote_write = self.clip_order.lock().await;
+        let overwritten = last_remote_write.is_some_and(|t| t > detected_at);
         let item = ClipboardItem {
             payload,
-            ts_ms: now_ms(),
+            ts_ms: now_ms().saturating_sub(detected_at.elapsed().as_millis() as u64),
             origin: self.self_id,
         };
+        if overwritten {
+            let latest = self.latest.lock().unwrap();
+            if latest
+                .as_ref()
+                .is_some_and(|cur| cur.origin != self.self_id && cur.wins_over(&item))
+            {
+                tracing::debug!("local copy superseded by a newer remote clip; dropping");
+                return;
+            }
+        }
+        self.broadcast_local_item(item.clone());
+        if overwritten {
+            if let Err(e) = self.writer.write(item.payload).await {
+                tracing::warn!(error = %e, "failed to restore local copy to clipboard");
+            }
+        }
+    }
+
+    /// SYNC-1: broadcast a locally-copied inline item to live peers, record it
+    /// as `latest`/history, and buffer it for offline trusted peers (SYNC-5).
+    fn broadcast_local_item(self: &Arc<Self>, item: ClipboardItem) {
         // A local copy is the freshest user intent: record it as latest.
         *self.latest.lock().unwrap() = Some(item.clone());
         // HIST-1/3: record the local clip under this device's own name.
