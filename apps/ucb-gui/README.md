@@ -23,7 +23,9 @@ no CLI. It still speaks to the daemon over its IPC socket, but it can also
 - **First-run onboarding.** If the socket is absent, an overlay offers to set up
   this device: it locates the `ucb` binary, runs `ucb init` if `config.json` is
   missing, then starts syncing. "Keep syncing in the background" installs a login
-  service (`ucb service install --activate`); otherwise the GUI spawns a
+  service (`ucb service install --activate`: a launchd agent, systemd user unit,
+  or on Windows a per-user `Run` entry that starts the bundled windowless `ucbw`
+  launcher); otherwise the GUI spawns a
   **managed** `ucb run` child that it kills when the app quits.
 - **Binary search order** (documented, used by onboarding + `ucb_binary_path`):
   **bundled sidecar** (`ucb` next to the GUI executable — where the Tauri bundler
@@ -210,6 +212,9 @@ cargo build --release -p ucb-daemon        # from the repo root
 bash scripts/prepare-sidecar.sh            # copies target/release/ucb → apps/ucb-gui/binaries/ucb-<triple>
 # scripts/prepare-sidecar.sh <triple>      # override the triple for cross/CI builds
 ```
+
+On Windows, `tauri.windows.conf.json` also bundles `ucbw`, the windowless
+launcher the login autostart entry runs, and the script stages it too.
 
 `binaries/` is git-ignored — it is a build output, regenerated per platform.
 

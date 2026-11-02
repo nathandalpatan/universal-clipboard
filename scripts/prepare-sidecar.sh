@@ -6,6 +6,8 @@
 # pick the right one per platform; the bundler strips the suffix again when it
 # copies the file next to the app executable. This script copies the release
 # `ucb` built at the workspace root into apps/ucb-gui/binaries/ with that suffix.
+# On Windows it also stages `ucbw`, the windowless launcher used by the login
+# autostart entry (bundled via tauri.windows.conf.json).
 #
 # Usage:
 #   scripts/prepare-sidecar.sh                 # auto-detect the host target triple
@@ -30,19 +32,20 @@ fi
 
 # Windows binaries carry a .exe extension on both source and sidecar name.
 EXT=""
+BINS=(ucb)
 case "$TRIPLE" in
-  *windows*) EXT=".exe" ;;
+  *windows*) EXT=".exe"; BINS=(ucb ucbw) ;;
 esac
 
-SRC="$REPO_ROOT/target/release/ucb${EXT}"
-if [[ ! -f "$SRC" ]]; then
-  echo "error: $SRC not found — run 'cargo build --release -p ucb-daemon' first" >&2
-  exit 1
-fi
-
-DEST="$BIN_DIR/ucb-${TRIPLE}${EXT}"
 mkdir -p "$BIN_DIR"
-cp -f "$SRC" "$DEST"
-chmod +x "$DEST"
-
-echo "staged sidecar: $DEST"
+for BIN in "${BINS[@]}"; do
+  SRC="$REPO_ROOT/target/release/${BIN}${EXT}"
+  if [[ ! -f "$SRC" ]]; then
+    echo "error: $SRC not found — run 'cargo build --release -p ucb-daemon' first" >&2
+    exit 1
+  fi
+  DEST="$BIN_DIR/${BIN}-${TRIPLE}${EXT}"
+  cp -f "$SRC" "$DEST"
+  chmod +x "$DEST"
+  echo "staged sidecar: $DEST"
+done
