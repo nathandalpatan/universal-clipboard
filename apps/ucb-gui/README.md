@@ -2,8 +2,9 @@
 
 A Tauri v2 tray application that is a **frontend** for the running
 `ucb` daemon. It does not embed the sync engine: it opens the daemon's
-existing unix-socket IPC (`<config-dir>/daemon.sock`, newline-delimited JSON)
-and relays commands. The daemon stays the single engine process.
+existing IPC (`<config-dir>/daemon.sock` — a unix socket, or on Windows the
+named pipe the daemon derives from that path; newline-delimited JSON) and
+relays commands. The daemon stays the single engine process.
 
 Tickets covered: **HIST-3** (history GUI), **UX-2** (devices + pair CTA),
 **PAIR-2** (on-screen QR pairing), **UX-3/UX-4** (spinner threshold, transfer
@@ -16,7 +17,7 @@ start/stop.
 ## The front door (Wave 4)
 
 The GUI is meant to be the *only* thing a user touches — install, pair, sync,
-no CLI. It still speaks to the daemon over the unix socket, but it can also
+no CLI. It still speaks to the daemon over its IPC socket, but it can also
 **set up and manage the daemon for you**:
 
 - **First-run onboarding.** If the socket is absent, an overlay offers to set up
@@ -108,7 +109,7 @@ screen sharing"* (persisted in `localStorage`, no restart needed).
 | Platform | Mechanism | Status |
 |----------|-----------|--------|
 | macOS | `NSWindow.sharingType = .none` (via `objc2` + `objc2-app-kit`, pulled from Tauri's window handle) | Enforced by the WindowServer |
-| Windows | `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` (`windows` crate) | **cfg-gated, compile-checked only** — no Windows host in CI |
+| Windows | `SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)` (`windows` crate) | Built + linted on `windows-latest` in CI; not exercised at runtime there |
 | Linux | none | **Not enforceable** — X11 has no primitive and Wayland capture policy is compositor-specific. Documented no-op; the Settings toggle notes it has no effect. |
 
 ### HIST-5 — biometric gate on History
@@ -291,13 +292,10 @@ sidecar, and hands off to `tauri-apps/tauri-action`, which builds the installers
 signs the updater artifacts with `TAURI_SIGNING_PRIVATE_KEY`, assembles
 `latest.json`, and uploads everything to the (draft) GitHub release for the tag.
 Publish the draft to make the update live. `ci.yml` additionally builds + clippy
-+ tests the GUI on `macos-latest` on every push/PR.
++ tests the GUI on `macos-latest` and `windows-latest` on every push/PR.
 
 ## Not done yet (future work)
 
-- **Windows/named-pipe client**: the IPC client is unix-socket only; on Windows
-  the commands return an "unsupported" error (the daemon speaks named pipes
-  there — a small client addition would close this).
 - `config_set` changes require a daemon restart to take effect; the reply reports
   `restart_required: true`, and the Settings **Restart sync** button applies it
   in one click for a GUI-managed daemon. Hot-reload is still future work.

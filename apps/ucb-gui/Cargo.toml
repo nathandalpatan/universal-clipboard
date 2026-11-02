@@ -47,8 +47,8 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "block2", "LAContext", "LAPublicDefines", "LAError"] }
 block2 = "0.6"
 
-# HIST-7 Windows screenshot exclusion (SetWindowDisplayAffinity). Cfg-gated and
-# compile-checked only on this branch — there is no Windows host in CI. Pinned to
+# HIST-7 Windows screenshot exclusion (SetWindowDisplayAffinity). Cfg-gated;
+# built by the windows-latest gui-check job in CI. Pinned to
 # 0.61 to match the `windows` crate already in tauri 2's Windows tree.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
