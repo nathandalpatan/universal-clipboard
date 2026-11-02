@@ -1,17 +1,20 @@
 # REL-1 (partial): continuous integration for the universal-clipboard workspace.
 #
-# On every push and pull request, build + test + lint the whole workspace on
-# Linux and macOS, then produce a release `ucb` daemon binary as a downloadable
-# artifact.
+# On pull requests and pushes to `main`, build + test + lint the whole
+# workspace on Linux and macOS, then produce a release `ucb` daemon binary as a
+# downloadable artifact.
 #
 # Signed release publishing (code-signing, the tauri-updater signed-manifest
 # pipeline, and a hosted latest.json) lives in .github/workflows/release.yml,
 # which runs on `v*` tags. This CI workflow uploads an unsigned `ucb` build
-# artifact for smoke-testing and lightly checks the Tauri GUI on macOS.
+# artifact for smoke-testing and lightly checks the Tauri GUI on macOS and Windows.
 name: CI
 
+# Feature-branch pushes are covered by `pull_request`; also triggering on every
+# push would run the whole matrix twice per PR commit.
 on:
   push:
+    branches: [main]
   pull_request:
 
 # Cancel superseded runs on the same ref to save CI minutes.
@@ -140,21 +143,18 @@ jobs:
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: ". -> target\napps/ucb-gui -> apps/ucb-gui/target"
+          workspaces: "apps/ucb-gui -> target"
 
-      # The GUI's tauri.conf.json declares the `ucb` sidecar (externalBin), so a
-      # build needs it staged. Build the daemon and stage it for the host triple.
-      # Default shell, not bash: on Windows, Git Bash's perl lacks modules the
-      # vendored OpenSSL build (rusqlite sqlcipher) needs; pwsh finds Strawberry Perl.
-      - name: Build ucb daemon
-        run: cargo build -p ucb-daemon
-
-      - name: Stage ucb sidecar
+      # tauri.conf.json declares the `ucb` sidecar (externalBin), and tauri-build
+      # fails unless the file exists. Nothing here runs it, so an empty
+      # placeholder is enough. This avoids building the whole daemon workspace
+      # (vendored OpenSSL + SQLCipher) in this job; the other jobs cover the daemon.
+      - name: Stage placeholder ucb sidecar
         shell: bash
         run: |
           mkdir -p apps/ucb-gui/binaries
           ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
-          cp "target/debug/ucb$ext" "apps/ucb-gui/binaries/ucb-$(rustc -vV | sed -n 's/^host: //p')$ext"
+          touch "apps/ucb-gui/binaries/ucb-$(rustc -vV | sed -n 's/^host: //p')$ext"
 
       - name: GUI clippy (deny warnings)
         working-directory: apps/ucb-gui
